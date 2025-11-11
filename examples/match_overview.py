@@ -542,6 +542,9 @@ def summarise_set_pieces(set_pieces: Optional[pd.DataFrame]) -> pd.DataFrame:
     if set_pieces is None or set_pieces.empty:
         return pd.DataFrame()
 
+    if "attackingSquadName" not in set_pieces.columns:
+        return pd.DataFrame()
+
     category_column = next(
         (
             column
@@ -559,21 +562,37 @@ def summarise_set_pieces(set_pieces: Optional[pd.DataFrame]) -> pd.DataFrame:
     if category_column is None:
         return pd.DataFrame()
 
+    dataframe = set_pieces.copy()
+    dataframe["category"] = dataframe[category_column].astype(str)
+
+    xg_columns = [column for column in dataframe.columns if "xg" in column.lower()]
+    if xg_columns:
+        dataframe["xg_total"] = dataframe[xg_columns].sum(axis=1)
+    else:
+        dataframe["xg_total"] = np.nan
+
+    count_source = "setPieceId" if "setPieceId" in dataframe.columns else "category"
     summary = (
-        set_pieces.groupby(category_column).size().reset_index(name="Anzahl")
-        .sort_values("Anzahl", ascending=False)
-        .head(10)
+        dataframe.groupby(["attackingSquadName", "category"])
+        .agg(
+            Anzahl=(count_source, "nunique") if count_source == "setPieceId" else (count_source, "size"),
+            xG=("xg_total", "sum"),
+        )
+        .reset_index()
     )
 
-    if "setPieceResult" in set_pieces.columns:
-        goals = (
-            set_pieces[set_pieces["setPieceResult"].astype(str).str.contains("GOAL", case=False, na=False)]
-            .groupby(category_column)
-            .size()
-        )
-        summary["Tore"] = summary[category_column].map(goals).fillna(0).astype(int)
+    summary = summary.rename(columns={"attackingSquadName": "Team", "category": "Kategorie"})
+    summary["Kategorie"] = summary["Kategorie"].str.replace("_", " ").str.title()
+    summary["Anzahl"] = summary["Anzahl"].astype(int)
 
-    return summary
+    focus_mask = summary["Kategorie"].str.contains("Free|Freistoß|Corner|Ecke", case=False, na=False)
+    if focus_mask.any():
+        summary = summary[focus_mask]
+
+    if "xG" in summary.columns:
+        summary["xG"] = summary["xG"].round(2)
+
+    return summary.sort_values(["Team", "Kategorie"]).reset_index(drop=True)
 
 
 def safe_api_call(description: str, func, *args, **kwargs):
@@ -873,20 +892,74 @@ def compute_xg_timeline(events: pd.DataFrame) -> pd.DataFrame:
     """Calculate the cumulative xG development over time."""
 
     events = add_minutes_column(events)
+    if "minute" not in events.columns:
+        return pd.DataFrame()
+
+    minute_series = pd.to_numeric(events["minute"], errors="coerce")
+    max_minute = minute_series.max()
+    if pd.isna(max_minute):
+        max_minute = None
+
+    squads = sorted({squad for squad in events.get("squadName", pd.Series(dtype=str)).dropna()})
+    if not squads:
+        return pd.DataFrame()
+
     xg_columns = [column for column in ["SHOT_XG", "PACKING_XG"] if column in events]
     if not xg_columns:
-        return pd.DataFrame()
+        xg_events = pd.DataFrame(columns=["minute", "cum_xg", "squadName"])
+    else:
+        events["xg"] = events[xg_columns].sum(axis=1)
+        xg_events = events[events["xg"] > 0].copy()
 
-    events["xg"] = events[xg_columns].sum(axis=1)
-    events = events[events["xg"] > 0].copy().sort_values("minute")
-    if events.empty:
-        return pd.DataFrame()
+    curves: List[pd.DataFrame] = []
 
-    curves = []
-    for squad, subset in events.groupby("squadName"):
-        subset = subset.sort_values("minute")
-        subset["cum_xg"] = subset["xg"].cumsum()
-        curves.append(subset[["minute", "cum_xg", "squadName"]])
+    for squad in squads:
+        subset = xg_events[xg_events["squadName"] == squad].copy()
+        if subset.empty:
+            base_minutes = [0.0]
+            if max_minute and max_minute > 0:
+                base_minutes.append(float(max_minute))
+            curve = pd.DataFrame(
+                {
+                    "minute": base_minutes,
+                    "cum_xg": [0.0] * len(base_minutes),
+                    "squadName": squad,
+                }
+            )
+        else:
+            subset = subset.sort_values("minute")
+            subset["cum_xg"] = subset["xg"].cumsum()
+            curve = subset[["minute", "cum_xg"]].copy()
+            curve.insert(0, "squadName", squad)
+            curve = curve[["minute", "cum_xg", "squadName"]]
+            if curve.iloc[0]["minute"] > 0:
+                curve = pd.concat(
+                    [
+                        pd.DataFrame({"minute": [0.0], "cum_xg": [0.0], "squadName": [squad]}),
+                        curve,
+                    ],
+                    ignore_index=True,
+                )
+            if max_minute and float(curve.iloc[-1]["minute"]) < float(max_minute):
+                last_value = float(curve.iloc[-1]["cum_xg"])
+                curve = pd.concat(
+                    [
+                        curve,
+                        pd.DataFrame(
+                            {
+                                "minute": [float(max_minute)],
+                                "cum_xg": [last_value],
+                                "squadName": [squad],
+                            }
+                        ),
+                    ],
+                    ignore_index=True,
+                )
+
+        curves.append(curve)
+
+    if not curves:
+        return pd.DataFrame()
 
     return pd.concat(curves, ignore_index=True)
 
@@ -1098,10 +1171,34 @@ def build_match_figure(
         "Rating",
     ]
     table_columns = [column for column in table_columns if column in players_table.columns]
-    players_table = players_table[table_columns].head(15)
+    players_table = players_table[table_columns]
 
-    additional_tables: List[Tuple[str, pd.DataFrame]] = [
-        ("Top-Spielerratings", players_table),
+    pos_group_order = {
+        "Goalkeeper": 0,
+        "Defender": 1,
+        "Midfielder": 2,
+        "Forward": 3,
+        "Other": 4,
+    }
+
+    player_sections: List[Tuple[str, pd.DataFrame]] = []
+    for team in [home, away]:
+        subset = players_table[players_table["Squadname"] == team].copy()
+        if subset.empty:
+            continue
+        subset["pos_group_sort"] = subset["Pos Group"].map(pos_group_order).fillna(len(pos_group_order))
+        subset = subset.sort_values(["pos_group_sort", "Position", "Rating"], ascending=[True, True, False])
+        subset = subset.drop(columns=["pos_group_sort", "Squadname"]).reset_index(drop=True)
+
+        numeric_columns = [column for column in subset.columns if is_numeric_dtype(subset[column])]
+        if numeric_columns:
+            subset[numeric_columns] = subset[numeric_columns].applymap(
+                lambda value: round(float(value), 2) if pd.notna(value) else np.nan
+            )
+
+        player_sections.append((f"Spielerratings – {team}", subset))
+
+    additional_tables: List[Tuple[str, pd.DataFrame]] = player_sections + [
         (
             "Player Match Scores",
             summarise_player_scores(player_scores, match_id),
@@ -1157,34 +1254,141 @@ def build_match_figure(
         team_kpis = team_kpis.sort_values("sort_key").drop(columns="sort_key")
 
     metrics = [column for column in team_kpis.columns if column != "Team"]
-    home_values = team_kpis.iloc[0][metrics].values.astype(float)
-    away_values = team_kpis.iloc[1][metrics].values.astype(float)
+    home_values = pd.to_numeric(team_kpis.iloc[0][metrics], errors="coerce").to_numpy(dtype=float)
+    away_values = pd.to_numeric(team_kpis.iloc[1][metrics], errors="coerce").to_numpy(dtype=float)
+    totals = home_values + away_values
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        home_share = np.divide(home_values, totals, out=np.zeros_like(home_values), where=totals != 0)
+        away_share = np.divide(away_values, totals, out=np.zeros_like(away_values), where=totals != 0)
+
+    home_custom = np.column_stack([home_values, totals])
+    away_custom = np.column_stack([away_values, totals])
+
+    home_text = [f"{value:.0%}" if total > 0 else "" for value, total in zip(home_share, totals)]
+    away_text = [f"{value:.0%}" if total > 0 else "" for value, total in zip(away_share, totals)]
 
     figure.add_trace(
-        go.Bar(x=home_values, y=metrics, orientation="h", name=home, marker_color=colors["home_main"]),
+        go.Bar(
+            x=home_share,
+            y=metrics,
+            orientation="h",
+            name=home,
+            marker_color=colors["home_main"],
+            customdata=home_custom,
+            text=home_text,
+            textposition="inside",
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                f"{home}: %{customdata[0]:.2f}<br>Gesamt: %{customdata[1]:.2f}<br>"
+                "Anteil: %{x:.0%}<extra></extra>"
+            ),
+        ),
         row=1,
         col=1,
     )
     figure.add_trace(
-        go.Bar(x=away_values, y=metrics, orientation="h", name=away, marker_color=colors["away_main"]),
+        go.Bar(
+            x=away_share,
+            y=metrics,
+            orientation="h",
+            name=away,
+            marker_color=colors["away_main"],
+            customdata=away_custom,
+            text=away_text,
+            textposition="inside",
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                f"{away}: %{customdata[0]:.2f}<br>Gesamt: %{customdata[1]:.2f}<br>"
+                "Anteil: %{x:.0%}<extra></extra>"
+            ),
+        ),
         row=1,
         col=1,
     )
+
+    figure.update_xaxes(range=[0, 1], tickformat=".0%", row=1, col=1)
 
     if not phase_xg.empty:
         phases_order = ["Spielaufbau", "Konter", "Pressing / 2. Bälle", "Standard", "Sonstige"]
-        for team, color in [(home, colors["home_main"]), (away, colors["away_main"])]:
-            subset = phase_xg[phase_xg["squadName"] == team]
+        pivot = (
+            phase_xg.pivot_table(
+                index="phase_group",
+                columns="squadName",
+                values="xg_total",
+                aggfunc="sum",
+            )
+            .reindex(phases_order)
+            .fillna(0.0)
+        )
+
+        phases = pivot.index.to_list()
+        home_phase_values = pivot[home].to_numpy(dtype=float) if home in pivot else np.zeros(len(phases))
+        away_phase_values = pivot[away].to_numpy(dtype=float) if away in pivot else np.zeros(len(phases))
+        totals_phase = home_phase_values + away_phase_values
+
+        valid_mask = totals_phase > 0
+        if valid_mask.any():
+            phases = [phase for phase, keep in zip(phases, valid_mask) if keep]
+            home_phase_values = home_phase_values[valid_mask]
+            away_phase_values = away_phase_values[valid_mask]
+            totals_phase = totals_phase[valid_mask]
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                home_phase_share = np.divide(
+                    home_phase_values, totals_phase, out=np.zeros_like(home_phase_values), where=totals_phase != 0
+                )
+                away_phase_share = np.divide(
+                    away_phase_values, totals_phase, out=np.zeros_like(away_phase_values), where=totals_phase != 0
+                )
+
+            home_phase_custom = np.column_stack([home_phase_values, totals_phase])
+            away_phase_custom = np.column_stack([away_phase_values, totals_phase])
+
+            home_phase_text = [f"{value:.0%}" if total > 0 else "" for value, total in zip(home_phase_share, totals_phase)]
+            away_phase_text = [f"{value:.0%}" if total > 0 else "" for value, total in zip(away_phase_share, totals_phase)]
+
             figure.add_trace(
                 go.Bar(
-                    x=phases_order,
-                    y=[subset.loc[subset["phase_group"] == phase, "xg_total"].sum() for phase in phases_order],
-                    name=team,
-                    marker_color=color,
+                    x=home_phase_share,
+                    y=phases,
+                    orientation="h",
+                    name=f"{home} xG-Anteil",
+                    marker_color=colors["home_main"],
+                    customdata=home_phase_custom,
+                    text=home_phase_text,
+                    textposition="inside",
+                    hovertemplate=(
+                        "<b>%{y}</b><br>"
+                        f"{home}: %{customdata[0]:.2f} xG<br>Gesamt: %{customdata[1]:.2f} xG<br>"
+                        "Anteil: %{x:.0%}<extra></extra>"
+                    ),
                 ),
                 row=2,
                 col=1,
             )
+            figure.add_trace(
+                go.Bar(
+                    x=away_phase_share,
+                    y=phases,
+                    orientation="h",
+                    name=f"{away} xG-Anteil",
+                    marker_color=colors["away_main"],
+                    customdata=away_phase_custom,
+                    text=away_phase_text,
+                    textposition="inside",
+                    hovertemplate=(
+                        "<b>%{y}</b><br>"
+                        f"{away}: %{customdata[0]:.2f} xG<br>Gesamt: %{customdata[1]:.2f} xG<br>"
+                        "Anteil: %{x:.0%}<extra></extra>"
+                    ),
+                ),
+                row=2,
+                col=1,
+            )
+
+            figure.update_xaxes(range=[0, 1], tickformat=".0%", row=2, col=1)
+            figure.update_yaxes(categoryorder="array", categoryarray=phases[::-1], row=2, col=1)
 
     if not timeline.empty:
         for team, color in [(home, colors["home_main"]), (away, colors["away_main"])]:
@@ -1231,7 +1435,7 @@ def build_match_figure(
 
     figure.update_layout(
         title=title,
-        barmode="group",
+        barmode="stack",
         height=850 + 220 * num_tables,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         template="plotly_white",
