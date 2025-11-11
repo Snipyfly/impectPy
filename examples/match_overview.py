@@ -1276,9 +1276,22 @@ def build_match_figure(
         base_row_heights.append(0.22)
     base_row_heights.append(0.26)
 
+    table_row_heights: List[float] = []
+    table_pixel_heights: List[int] = []
+    for _, table in table_sections:
+        num_rows = int(table.shape[0]) if hasattr(table, "shape") else 0
+        # Give tables with many rows more vertical space inside the subplot layout.
+        weight = 0.24 + 0.018 * min(num_rows, 20)
+        table_row_heights.append(min(0.62, weight))
+
+        # Increase the rendered figure height in pixels based on the table size so
+        # rows stay readable even when lots of sections are shown.
+        extra_rows = max(0, num_rows - 6)
+        pixel_height = 280 + extra_rows * 26
+        table_pixel_heights.append(pixel_height)
+
     if num_tables:
-        table_height = max(0.2, min(0.26, 0.6 / num_tables))
-        row_heights = base_row_heights + [table_height] * num_tables
+        row_heights = base_row_heights + table_row_heights
     else:
         row_heights = base_row_heights
 
@@ -1578,14 +1591,14 @@ def build_match_figure(
                     header=dict(
                         values=list(table.columns),
                         fill_color="#222222",
-                        font=dict(color="white", size=11),
+                        font=dict(color="white", size=12),
                         align="left",
                     ),
                     cells=dict(
                         values=[table[column].tolist() for column in table.columns],
                         fill_color="#F5F5F5",
-                        font=dict(size=11),
-                        height=26,
+                        font=dict(size=12),
+                        height=28,
                         align="left",
                     ),
                 ),
@@ -1596,7 +1609,8 @@ def build_match_figure(
     figure.update_layout(
         title=title,
         barmode="group",
-        height=950 + 240 * num_tables,
+        height=960 + sum(table_pixel_heights),
+        width=1500,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         template="plotly_white",
     )
