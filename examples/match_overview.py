@@ -1360,7 +1360,7 @@ def build_match_figure(
                     textposition="inside",
                     hovertemplate=(
                         "<b>%{y}</b><br>"
-                        f"{home}: %{customdata[0]:.2f} xG<br>Gesamt: %{customdata[1]:.2f} xG<br>"
+                        f"{home}: %{{customdata[0]:.2f}} xG<br>Gesamt: %{{customdata[1]:.2f}} xG<br>"
                         "Anteil: %{x:.0%}<extra></extra>"
                     ),
                 ),
@@ -1379,7 +1379,7 @@ def build_match_figure(
                     textposition="inside",
                     hovertemplate=(
                         "<b>%{y}</b><br>"
-                        f"{away}: %{customdata[0]:.2f} xG<br>Gesamt: %{customdata[1]:.2f} xG<br>"
+                        f"{away}: %{{customdata[0]:.2f}} xG<br>Gesamt: %{{customdata[1]:.2f}} xG<br>"
                         "Anteil: %{x:.0%}<extra></extra>"
                     ),
                 ),
