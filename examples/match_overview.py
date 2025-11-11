@@ -1295,7 +1295,7 @@ def build_match_figure(
     if has_set_piece_chart:
         specs.append([{"type": "bar"}])
     specs.append([{"type": "scatter"}])
-    specs.extend([[{"type": "table"}]] for _ in table_sections)
+    specs.extend([[{"type": "table"}] for _ in table_sections])
 
     figure = make_subplots(
         rows=total_rows,
