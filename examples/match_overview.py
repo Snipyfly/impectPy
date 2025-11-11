@@ -1271,23 +1271,23 @@ def build_match_figure(
     base_rows = 3 + (1 if has_set_piece_chart else 0)
     total_rows = base_rows + num_tables
 
-    base_row_heights: List[float] = [0.24, 0.22]
+    base_row_heights: List[float] = [0.34, 0.3]
     if has_set_piece_chart:
-        base_row_heights.append(0.22)
-    base_row_heights.append(0.26)
+        base_row_heights.append(0.3)
+    base_row_heights.append(0.32)
 
     table_row_heights: List[float] = []
     table_pixel_heights: List[int] = []
     for _, table in table_sections:
         num_rows = int(table.shape[0]) if hasattr(table, "shape") else 0
         # Give tables with many rows more vertical space inside the subplot layout.
-        weight = 0.24 + 0.018 * min(num_rows, 20)
-        table_row_heights.append(min(0.62, weight))
+        weight = 0.32 + 0.022 * min(num_rows, 20)
+        table_row_heights.append(min(0.8, weight))
 
         # Increase the rendered figure height in pixels based on the table size so
         # rows stay readable even when lots of sections are shown.
         extra_rows = max(0, num_rows - 6)
-        pixel_height = 280 + extra_rows * 26
+        pixel_height = 360 + extra_rows * 32
         table_pixel_heights.append(pixel_height)
 
     if num_tables:
@@ -1591,14 +1591,15 @@ def build_match_figure(
                     header=dict(
                         values=list(table.columns),
                         fill_color="#222222",
-                        font=dict(color="white", size=12),
+                        font=dict(color="white", size=14),
                         align="left",
+                        height=44,
                     ),
                     cells=dict(
                         values=[table[column].tolist() for column in table.columns],
                         fill_color="#F5F5F5",
-                        font=dict(size=12),
-                        height=28,
+                        font=dict(size=13),
+                        height=44,
                         align="left",
                     ),
                 ),
@@ -1609,7 +1610,7 @@ def build_match_figure(
     figure.update_layout(
         title=title,
         barmode="group",
-        height=960 + sum(table_pixel_heights),
+        height=1200 + sum(table_pixel_heights),
         width=1500,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         template="plotly_white",
