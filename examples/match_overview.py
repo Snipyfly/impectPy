@@ -1047,6 +1047,42 @@ def compute_player_ratings(
     players["won_duels"] = players.get("WON_GROUND_DUELS", 0.0) + players.get("WON_AERIAL_DUELS", 0.0)
     players["lost_duels"] = players.get("LOST_GROUND_DUELS", 0.0) + players.get("LOST_AERIAL_DUELS", 0.0)
     players["presses"] = players.get("NUMBER_OF_PRESSES", 0.0)
+
+    if players["lost_duels"].sum() == 0 and {"duelPlayerId", "duelResult"}.issubset(events.columns):
+        duel_events = events[(events["duelPlayerId"].notna()) & (events["duelResult"].notna())]
+        if not duel_events.empty:
+            lost_duels = (
+                duel_events[duel_events["duelResult"].str.upper() == "LOST"]
+                .groupby("duelPlayerId")
+                .size()
+            )
+            if not lost_duels.empty:
+                players = players.merge(
+                    lost_duels.rename("lost_duels_fallback"),
+                    left_on="playerId",
+                    right_index=True,
+                    how="left",
+                )
+                players["lost_duels"] = players["lost_duels"].where(
+                    players["lost_duels"] > 0, players["lost_duels_fallback"].fillna(0)
+                )
+                players = players.drop(columns=["lost_duels_fallback"])
+
+    if players["presses"].sum() == 0 and "pressingPlayerId" in events.columns:
+        press_events = events[events["pressingPlayerId"].notna()]
+        if not press_events.empty:
+            presses = press_events.groupby("pressingPlayerId").size()
+            if not presses.empty:
+                players = players.merge(
+                    presses.rename("presses_fallback"),
+                    left_on="playerId",
+                    right_index=True,
+                    how="left",
+                )
+                players["presses"] = players["presses"].where(
+                    players["presses"] > 0, players["presses_fallback"].fillna(0)
+                )
+                players = players.drop(columns=["presses_fallback"])
     players["def_threat"] = players.get("PXT_BLOCK", 0.0)
 
     minutes = infer_minutes_from_matchsums(player_matchsums)
@@ -1198,6 +1234,8 @@ def build_match_figure(
 
         player_sections.append((f"Spielerratings – {team}", subset))
 
+    set_piece_summary = summarise_set_pieces(set_pieces)
+
     additional_tables: List[Tuple[str, pd.DataFrame]] = player_sections + [
         (
             "Player Match Scores",
@@ -1221,28 +1259,48 @@ def build_match_figure(
         ),
         (
             "Set Piece Übersicht",
-            summarise_set_pieces(set_pieces),
+            set_piece_summary,
         ),
     ]
 
     table_sections = [(title, table) for title, table in additional_tables if table is not None and not table.empty]
 
     num_tables = len(table_sections)
-    total_rows = 3 + num_tables
+    has_set_piece_chart = set_piece_summary is not None and not set_piece_summary.empty
 
-    row_heights = [0.24, 0.2, 0.28] + [0.18] * num_tables
+    base_rows = 3 + (1 if has_set_piece_chart else 0)
+    total_rows = base_rows + num_tables
+
+    base_row_heights: List[float] = [0.24, 0.22]
+    if has_set_piece_chart:
+        base_row_heights.append(0.22)
+    base_row_heights.append(0.26)
+
+    if num_tables:
+        table_height = max(0.2, min(0.26, 0.6 / num_tables))
+        row_heights = base_row_heights + [table_height] * num_tables
+    else:
+        row_heights = base_row_heights
+
     subplot_titles = [
         "Teamvergleich",
         "xG nach Spielphasen (Aufbau / Konter / Pressing / Standard / Sonstige)",
-        "xG-Verlauf",
-    ] + [title for title, _ in table_sections]
+    ]
+    if has_set_piece_chart:
+        subplot_titles.append("Set Piece xG-Anteile")
+    subplot_titles.append("xG-Verlauf")
+    subplot_titles.extend(title for title, _ in table_sections)
 
-    specs = [[{"type": "bar"}], [{"type": "bar"}], [{"type": "scatter"}]] + [[{"type": "table"}] for _ in table_sections]
+    specs: List[List[Dict[str, str]]] = [[{"type": "bar"}], [{"type": "bar"}]]
+    if has_set_piece_chart:
+        specs.append([{"type": "bar"}])
+    specs.append([{"type": "scatter"}])
+    specs.extend([[{"type": "table"}]] for _ in table_sections)
 
     figure = make_subplots(
         rows=total_rows,
         cols=1,
-        vertical_spacing=0.07,
+        vertical_spacing=0.08,
         row_heights=row_heights,
         specs=specs,
         subplot_titles=tuple(subplot_titles),
@@ -1308,6 +1366,7 @@ def build_match_figure(
     )
 
     figure.update_xaxes(range=[0, 1], tickformat=".0%", row=1, col=1)
+    figure.update_yaxes(categoryorder="array", categoryarray=metrics[::-1], row=1, col=1)
 
     if not phase_xg.empty:
         phases_order = ["Spielaufbau", "Konter", "Pressing / 2. Bälle", "Standard", "Sonstige"]
@@ -1390,6 +1449,104 @@ def build_match_figure(
             figure.update_xaxes(range=[0, 1], tickformat=".0%", row=2, col=1)
             figure.update_yaxes(categoryorder="array", categoryarray=phases[::-1], row=2, col=1)
 
+    set_piece_row = 3 if has_set_piece_chart else None
+    timeline_row = 3 + (1 if has_set_piece_chart else 0)
+
+    if has_set_piece_chart:
+        pivot_xg = (
+            set_piece_summary.pivot_table(index="Kategorie", columns="Team", values="xG", aggfunc="sum")
+            .fillna(0.0)
+        )
+        pivot_counts = (
+            set_piece_summary.pivot_table(index="Kategorie", columns="Team", values="Anzahl", aggfunc="sum")
+            .fillna(0.0)
+        )
+
+        categories = pivot_xg.index.to_list()
+        home_set_piece = (
+            pivot_xg[home].to_numpy(dtype=float) if home in pivot_xg else np.zeros(len(categories))
+        )
+        away_set_piece = (
+            pivot_xg[away].to_numpy(dtype=float) if away in pivot_xg else np.zeros(len(categories))
+        )
+        home_counts = (
+            pivot_counts[home].to_numpy(dtype=float) if home in pivot_counts else np.zeros(len(categories))
+        )
+        away_counts = (
+            pivot_counts[away].to_numpy(dtype=float) if away in pivot_counts else np.zeros(len(categories))
+        )
+
+        totals_xg = home_set_piece + away_set_piece
+        totals_counts = home_counts + away_counts
+
+        valid_mask = (totals_xg > 0) | (totals_counts > 0)
+        if valid_mask.any():
+            categories = [category for category, keep in zip(categories, valid_mask) if keep]
+            home_set_piece = home_set_piece[valid_mask]
+            away_set_piece = away_set_piece[valid_mask]
+            home_counts = home_counts[valid_mask]
+            away_counts = away_counts[valid_mask]
+            totals_xg = totals_xg[valid_mask]
+            totals_counts = totals_counts[valid_mask]
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                home_share = np.divide(
+                    home_set_piece, totals_xg, out=np.zeros_like(home_set_piece), where=totals_xg != 0
+                )
+                away_share = np.divide(
+                    away_set_piece, totals_xg, out=np.zeros_like(away_set_piece), where=totals_xg != 0
+                )
+
+            home_custom = np.column_stack([home_set_piece, totals_xg, home_counts, totals_counts])
+            away_custom = np.column_stack([away_set_piece, totals_xg, away_counts, totals_counts])
+
+            home_text = [f"{value:.0%}" if total > 0 else "" for value, total in zip(home_share, totals_xg)]
+            away_text = [f"{value:.0%}" if total > 0 else "" for value, total in zip(away_share, totals_xg)]
+
+            figure.add_trace(
+                go.Bar(
+                    x=home_share,
+                    y=categories,
+                    orientation="h",
+                    name=f"{home} Set Pieces",
+                    marker_color=colors["home_main"],
+                    customdata=home_custom,
+                    text=home_text,
+                    textposition="inside",
+                    hovertemplate=(
+                        "<b>%{y}</b><br>"
+                        f"{home}: %{{customdata[0]:.2f}} xG | %{{customdata[2]:.0f}} Aktionen<br>"
+                        "Gesamt: %{customdata[1]:.2f} xG | %{customdata[3]:.0f} Aktionen<br>"
+                        "Anteil: %{x:.0%}<extra></extra>"
+                    ),
+                ),
+                row=set_piece_row,
+                col=1,
+            )
+            figure.add_trace(
+                go.Bar(
+                    x=away_share,
+                    y=categories,
+                    orientation="h",
+                    name=f"{away} Set Pieces",
+                    marker_color=colors["away_main"],
+                    customdata=away_custom,
+                    text=away_text,
+                    textposition="inside",
+                    hovertemplate=(
+                        "<b>%{y}</b><br>"
+                        f"{away}: %{{customdata[0]:.2f}} xG | %{{customdata[2]:.0f}} Aktionen<br>"
+                        "Gesamt: %{customdata[1]:.2f} xG | %{customdata[3]:.0f} Aktionen<br>"
+                        "Anteil: %{x:.0%}<extra></extra>"
+                    ),
+                ),
+                row=set_piece_row,
+                col=1,
+            )
+
+            figure.update_xaxes(range=[0, 1], tickformat=".0%", row=set_piece_row, col=1)
+            figure.update_yaxes(categoryorder="array", categoryarray=categories[::-1], row=set_piece_row, col=1)
+
     if not timeline.empty:
         for team, color in [(home, colors["home_main"]), (away, colors["away_main"])]:
             subset = timeline[timeline["squadName"] == team]
@@ -1403,16 +1560,17 @@ def build_match_figure(
                     name=f"{team} xG",
                     line=dict(shape="hv", color=color),
                 ),
-                row=3,
+                row=timeline_row,
                 col=1,
             )
 
-    figure.update_xaxes(title_text="Minute", row=3, col=1)
-    figure.update_yaxes(title_text="xGoals", row=3, col=1)
+    figure.update_xaxes(title_text="Minute", row=timeline_row, col=1)
+    figure.update_yaxes(title_text="xGoals", row=timeline_row, col=1)
 
+    table_row_start = base_rows + 1
     for index, (section_title, table) in enumerate(table_sections):
         table = table.copy()
-        row_index = 4 + index
+        row_index = table_row_start + index
         if not table.empty:
             table = table.where(pd.notna(table), None)
             figure.add_trace(
@@ -1426,6 +1584,8 @@ def build_match_figure(
                     cells=dict(
                         values=[table[column].tolist() for column in table.columns],
                         fill_color="#F5F5F5",
+                        font=dict(size=11),
+                        height=26,
                         align="left",
                     ),
                 ),
@@ -1435,8 +1595,8 @@ def build_match_figure(
 
     figure.update_layout(
         title=title,
-        barmode="stack",
-        height=850 + 220 * num_tables,
+        barmode="group",
+        height=950 + 240 * num_tables,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         template="plotly_white",
     )
