@@ -43,7 +43,7 @@ def getIterationsFromHost(connection: RateLimitedAPI, host: str) -> pd.DataFrame
     df = df.drop("idMappings", axis = 1)
 
     # fix column names using regex
-    df = df.rename(columns=lambda x: re.sub("[\._](.)", lambda y: y.group(1).upper(), x))
+    df = df.rename(columns=lambda x: re.sub(r"[._](.)", lambda y: y.group(1).upper(), x))
 
     # keep first entry for skillcorner, heimspiel and wyscout data
     df.skillCornerId = df.skillCornerId.apply(lambda x: x[0] if x else None)

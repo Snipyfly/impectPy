@@ -151,7 +151,7 @@ def clean_df(data: dict) -> pd.DataFrame:
     df = pd.json_normalize(data)
 
     # fix column names using regex
-    df = df.rename(columns=lambda x: re.sub("[\._](.)", lambda y: y.group(1).upper(), x))
+    df = df.rename(columns=lambda x: re.sub(r"[._](.)", lambda y: y.group(1).upper(), x))
 
     # drop idMappings column
     df = df.drop("idMappings", axis=1)
