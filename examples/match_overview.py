@@ -31,6 +31,7 @@ timeline and individual player ratings.
 from __future__ import annotations
 
 import os
+import re
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -1295,7 +1296,7 @@ def build_match_figure(
     else:
         row_heights = base_row_heights
 
-    subplot_titles = [
+    subplot_titles: List[str] = [
         "Teamvergleich",
         "xG nach Spielphasen (Aufbau / Konter / Pressing / Standard / Sonstige)",
     ]
@@ -1317,16 +1318,62 @@ def build_match_figure(
             f"({total_rows}) überein."
         )
 
-    specs: List[List[Dict[str, str]]] = [[{"type": chart_type}] for chart_type in chart_types]
+    def build_specs_matrix(columns: int) -> List[List[Optional[Dict[str, object]]]]:
+        matrix: List[List[Optional[Dict[str, object]]]] = []
+        for chart_type in chart_types:
+            row_spec: List[Optional[Dict[str, object]]] = []
+            spec: Dict[str, object] = {"type": chart_type}
+            if columns > 1:
+                spec["colspan"] = columns
+            row_spec.append(spec)
+            row_spec.extend([None] * (columns - 1))
+            matrix.append(row_spec)
+        return matrix
 
-    figure = make_subplots(
-        rows=total_rows,
-        cols=1,
-        vertical_spacing=0.08,
-        row_heights=row_heights,
-        specs=specs,
-        subplot_titles=tuple(subplot_titles),
-    )
+    def expand_subplot_titles(columns: int) -> Tuple[str, ...]:
+        if columns <= 1:
+            return tuple(subplot_titles)
+        padded: List[str] = []
+        for title in subplot_titles:
+            padded.append(title)
+            padded.extend([""] * (columns - 1))
+        return tuple(padded)
+
+    columns = 1
+    specs = build_specs_matrix(columns)
+    titles = expand_subplot_titles(columns)
+
+    try:
+        figure = make_subplots(
+            rows=total_rows,
+            cols=columns,
+            vertical_spacing=0.08,
+            row_heights=row_heights,
+            specs=specs,
+            subplot_titles=titles,
+        )
+    except ValueError as error:
+        message = str(error)
+        match = re.search(r"\((\d+)\s*x\s*(\d+)\)", message)
+        if "specs" not in message or match is None:
+            raise
+
+        expected_rows = int(match.group(1))
+        expected_columns = int(match.group(2))
+        if expected_rows != total_rows or expected_columns <= 0:
+            raise
+
+        columns = expected_columns
+        specs = build_specs_matrix(columns)
+        titles = expand_subplot_titles(columns)
+        figure = make_subplots(
+            rows=total_rows,
+            cols=columns,
+            vertical_spacing=0.08,
+            row_heights=row_heights,
+            specs=specs,
+            subplot_titles=titles,
+        )
 
     team_kpis = team_kpis.copy()
     if set(team_kpis["Team"]) == {home, away}:
