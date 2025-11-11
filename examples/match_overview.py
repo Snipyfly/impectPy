@@ -1,0 +1,740 @@
+"""Example script for generating an interactive match overview dashboard.
+
+The script mirrors the workflow from the README and demonstrates how to
+combine the high-level helper functions provided by :mod:`impectPy` to load a
+match, compute a handful of metrics and visualise them with Plotly.
+
+Steps
+-----
+1. Authenticate via :func:`impectPy.getAccessToken`.
+2. Fetch the list of available iterations with :func:`impectPy.getIterations`.
+3. Ask the user which iteration and match should be analysed.
+4. Load the event data, match sums and iteration averages.
+5. Aggregate the raw data into team, phase, time-line and player level KPIs.
+6. Plot the result as an interactive Plotly figure.
+
+Running the example
+-------------------
+Set the ``USERNAME`` and ``PASSWORD`` constants below or export the matching
+environment variables before executing the script::
+
+    export IMPLECT_USERNAME="you@example.com"
+    export IMPLECT_PASSWORD="secret"
+    python examples/match_overview.py
+
+When run, the script provides a guided command line interface that allows you
+to pick a season/iteration and match from the available data.  The final step
+is an interactive Plotly window summarising team KPIs, xG by phase, an xG
+timeline and individual player ratings.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Dict, Iterable, List
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+import impectPy as ip
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+USERNAME = os.getenv("IMPLECT_USERNAME", "")
+PASSWORD = os.getenv("IMPLECT_PASSWORD", "")
+DEFAULT_SEASON = "25/26"
+
+
+# ---------------------------------------------------------------------------
+# Helper data-classes & functions
+# ---------------------------------------------------------------------------
+
+
+def _prompt(prompt: str, default: str) -> str:
+    """Return the users input or a default when the reply is empty."""
+
+    reply = input(prompt).strip()
+    return reply or default
+
+
+def get_access_token(username: str, password: str) -> str:
+    """Authenticate the user and return an API token."""
+
+    print("🔐 Hole Access-Token...")
+    return ip.getAccessToken(username=username, password=password)
+
+
+def choose_iteration(token: str) -> int:
+    """Interactively prompt the user for an iteration ID."""
+
+    print("📚 Hole Iterations-Übersicht...")
+    iterations = pd.DataFrame(ip.getIterations(token))
+    iterations["season"] = iterations["season"].astype(str)
+
+    seasons = sorted(iterations["season"].unique())
+    print("\nVerfügbare Saisons:", seasons)
+
+    season = _prompt(
+        f"Saison wählen (z.B. {DEFAULT_SEASON}) [Enter = {DEFAULT_SEASON}]: ",
+        DEFAULT_SEASON,
+    )
+
+    iteration_table = iterations[iterations["season"] == season]
+    if iteration_table.empty:
+        print(f"⚠️ Keine Iterationen für Saison {season} gefunden, nutze alle Iterationen.")
+        iteration_table = iterations
+
+    print("\n📋 Verfügbare Wettbewerbe / Iterationen:")
+    iteration_table = iteration_table.sort_values(["competitionName", "id"])
+    for idx, row in enumerate(iteration_table.itertuples(), start=1):
+        print(f"{idx:2d}) id={row.id} | {row.competitionName} | Saison {row.season}")
+
+    default_index = 1
+    selected_index = _prompt(
+        f"\nNummer der gewünschten Iteration (z.B. {default_index}) "
+        f"[Enter = {default_index}]: ",
+        str(default_index),
+    )
+
+    try:
+        selected_index = int(selected_index)
+    except ValueError:
+        selected_index = default_index
+
+    selected_index = max(1, min(selected_index, len(iteration_table)))
+    selection = iteration_table.iloc[selected_index - 1]
+
+    print(
+        "\n✅ Gewählte Iteration: id={id} | {competition} | Saison {season}\n".format(
+            id=int(selection["id"]),
+            competition=selection["competitionName"],
+            season=selection["season"],
+        )
+    )
+    return int(selection["id"])
+
+
+def get_matchplan(token: str, iteration_id: int) -> pd.DataFrame:
+    """Fetch the match plan for the provided iteration."""
+
+    print(f"📅 Hole Matchplan für Iteration (Saison) {iteration_id}...")
+    matchplan = pd.DataFrame(ip.getMatches(iteration_id, token))
+    print("   Matchplan-Spalten:", list(matchplan.columns))
+    return matchplan
+
+
+def choose_match(matchplan: pd.DataFrame) -> int:
+    """Prompt the user to choose a match ID from the match plan."""
+
+    matchplan = matchplan.copy()
+    sort_columns = [
+        column
+        for column in ["matchDayIndex", "scheduledDate", "dateTime", "id"]
+        if column in matchplan.columns
+    ]
+    if sort_columns:
+        matchplan = matchplan.sort_values(sort_columns)
+
+    print("\n📋 Verfügbare Spiele:")
+    for row in matchplan.itertuples():
+        matchday = getattr(row, "matchDayIndex", "?")
+        home = getattr(row, "homeSquadName", "?")
+        away = getattr(row, "awaySquadName", "?")
+        date = getattr(row, "scheduledDate", getattr(row, "dateTime", "?"))
+        match_id = getattr(row, "id")
+        print(f"- MD {matchday}: {home} vs {away} (matchId={match_id}, Datum={date})")
+
+    default_match_id = int(matchplan.iloc[0]["id"])
+    selection = _prompt(
+        f"\nGewünschte matchId eingeben [Enter = {default_match_id}]: ",
+        str(default_match_id),
+    )
+
+    try:
+        match_id = int(selection)
+    except ValueError:
+        match_id = default_match_id
+
+    print(f"\n✅ Gewähltes Spiel: matchId={match_id}\n")
+    return match_id
+
+
+def derive_minute_str(game_time: str) -> float:
+    """Convert the API ``gameTime`` string into minutes as float."""
+
+    if not isinstance(game_time, str):
+        try:
+            return float(game_time) / 60.0
+        except Exception:  # pragma: no cover - defensive casting
+            return np.nan
+
+    if ":" in game_time:
+        minutes, seconds = game_time.split(":", 1)
+        try:
+            return float(minutes) + float(seconds) / 60.0
+        except Exception:  # pragma: no cover - defensive casting
+            return np.nan
+
+    try:
+        return float(game_time) / 60.0
+    except Exception:  # pragma: no cover - defensive casting
+        return np.nan
+
+
+def add_minutes_column(events: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of ``events`` that contains an additional ``minute`` column."""
+
+    events = events.copy()
+    if "gameTime" in events.columns:
+        events["minute"] = events["gameTime"].astype(str).apply(derive_minute_str)
+    else:
+        events["minute"] = np.nan
+    return events
+
+
+# ---------------------------------------------------------------------------
+# Aggregations
+# ---------------------------------------------------------------------------
+
+
+def map_phase(phase: str) -> str:
+    """Bucket the impect phase into broader xG categories."""
+
+    if not isinstance(phase, str):
+        return "Sonstige"
+
+    phase_upper = phase.upper()
+    if "SET_PIECE" in phase_upper:
+        return "Standard"
+    if "ATTACKING_TRANSITION" in phase_upper or "COUNTER" in phase_upper:
+        return "Konter"
+    if "SECOND_BALL" in phase_upper:
+        return "Pressing / 2. Bälle"
+    if "IN_POSSESSION" in phase_upper or "BUILD_UP" in phase_upper:
+        return "Spielaufbau"
+    return "Sonstige"
+
+
+def get_team_colors(home_name: str, away_name: str) -> Dict[str, str]:
+    """Return distinct colours for both squads used in the figure."""
+
+    palette = {
+        "SpVgg Greuther Fürth": ("#008C45", "#CCCCCC"),
+        "Preußen Münster": ("#000000", "#888888"),
+        "1. FC Kaiserslautern": ("#B00030", "#999999"),
+        "SV Werder Bremen": ("#008A3A", "#CCCCCC"),
+        "VfL Wolfsburg": ("#63B22F", "#999999"),
+        "Hertha BSC": ("#004C9B", "#FFB300"),
+        "FC Schalke 04": ("#1F4FA3", "#FFB300"),
+    }
+
+    def pick(name: str, default_main: str, default_alt: str) -> Iterable[str]:
+        if name in palette:
+            return palette[name]
+        return default_main, default_alt
+
+    home_color, home_alt = pick(home_name, "#1f77b4", "#aec7e8")
+    away_color, away_alt = pick(away_name, "#d62728", "#ff9896")
+
+    return {
+        "home_main": home_color,
+        "home_alt": home_alt,
+        "away_main": away_color,
+        "away_alt": away_alt,
+    }
+
+
+def infer_minutes_from_matchsums(matchsums: List[Dict[str, float]]) -> pd.DataFrame:
+    """Infer the played minutes from the match sums payload."""
+
+    df = pd.DataFrame(matchsums).copy()
+    if df.empty:
+        return pd.DataFrame({"playerId": [], "minutes": []})
+
+    columns_lower = {column.lower(): column for column in df.columns}
+
+    if "minutes" in columns_lower:
+        source_column = columns_lower["minutes"]
+        df["minutes"] = pd.to_numeric(df[source_column], errors="coerce")
+    elif "minutesplayed" in columns_lower:
+        source_column = columns_lower["minutesplayed"]
+        df["minutes"] = pd.to_numeric(df[source_column], errors="coerce")
+    else:
+        minute_columns = [column for column in df.columns if "minute" in column.lower()]
+        if minute_columns:
+            source_column = minute_columns[0]
+            df["minutes"] = pd.to_numeric(df[source_column], errors="coerce")
+        else:
+            share_columns = [column for column in df.columns if "matchshare" in column.lower()]
+            if share_columns:
+                source_column = share_columns[0]
+                df["minutes"] = pd.to_numeric(df[source_column], errors="coerce") * 90.0
+            else:
+                df["minutes"] = 90.0
+
+    df["minutes"] = df["minutes"].fillna(0.0)
+    return df[["playerId", "minutes"]]
+
+
+def group_position(position: str) -> str:
+    """Map the detailed position into broader buckets."""
+
+    if not isinstance(position, str):
+        return "Other"
+
+    position_upper = position.upper()
+    if "KEEPER" in position_upper:
+        return "Goalkeeper"
+    if "DEFENDER" in position_upper or "BACK" in position_upper:
+        return "Defender"
+    if "MIDFIELD" in position_upper:
+        return "Midfielder"
+    if "FORWARD" in position_upper or "STRIKER" in position_upper or "WINGER" in position_upper:
+        return "Forward"
+    return "Other"
+
+
+def normalize_by_pos(raw: pd.Series, positions: pd.Series) -> pd.Series:
+    """Normalise scores to a 1..10 scale within each positional group."""
+
+    frame = pd.DataFrame({"value": raw, "position": positions})
+    scores = pd.Series(index=frame.index, dtype=float)
+
+    for position, subset in frame.groupby("position"):
+        values = subset["value"]
+        if values.max() == values.min():
+            scores.loc[subset.index] = 5.0 if values.max() == 0 else 10.0
+        else:
+            scores.loc[subset.index] = 1.0 + 9.0 * (values - values.min()) / (values.max() - values.min())
+
+    return scores.clip(0, 10)
+
+
+def compute_team_kpis(events: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate a selection of team level KPIs for the figure."""
+
+    events = events.copy()
+    groups = events.groupby(["squadId", "squadName"])
+
+    rows = []
+    for (_squad_id, squad_name), subset in groups:
+        row: Dict[str, float] = {"Team": squad_name}
+
+        if "GOALS" in subset:
+            row["Goals"] = subset["GOALS"].sum()
+        elif "score" in subset:
+            row["Goals"] = subset["score"].diff().clip(lower=0).sum()
+        else:
+            row["Goals"] = np.nan
+
+        shot_xg = subset.get("SHOT_XG", pd.Series(dtype=float)).sum()
+        packing_xg = subset.get("PACKING_XG", pd.Series(dtype=float)).sum()
+        row["xGoals (Shot+Packing)"] = shot_xg + packing_xg
+
+        pxt_columns = [
+            column
+            for column in [
+                "PXT_PASS",
+                "PXT_DRIBBLE",
+                "PXT_SETPIECE",
+                "PXT_SHOT",
+                "PXT_BALL_WIN",
+                "PXT_BLOCK",
+            ]
+            if column in subset
+        ]
+        row["Goal Threat gesamt (pxT)"] = subset[pxt_columns].sum(axis=1).sum() if pxt_columns else np.nan
+
+        def add_if(column: str, label: str) -> None:
+            row[label] = subset[column].sum() if column in subset else np.nan
+
+        add_if("SHOT_AT_GOAL_NUMBER", "Torschüsse")
+        add_if("CRITICAL_BALL_LOSS_NUMBER", "Kritische Ballverluste")
+        add_if("WON_GROUND_DUELS", "Gew. Boden-Duelle")
+        add_if("WON_AERIAL_DUELS", "Gew. Kopfball-Duelle")
+        add_if("EXPECTED_PASSES", "Expected Passes")
+        add_if("BYPASSED_OPPONENTS_TO_PITCH_POSITION_FINAL_THIRD", "Bypassed Opponents (Final 3rd)")
+        add_if(
+            "BYPASSED_DEFENDERS_BY_ACTION_LOW_PASS",
+            "Bypassed Defenders (Low Pass)",
+        )
+        add_if(
+            "OFFENSIVE_TOUCHES_IN_PITCH_POSITION_FINAL_THIRD",
+            "Offensive Kontakte im letzten Drittel",
+        )
+
+        rows.append(row)
+
+    team_kpis = pd.DataFrame(rows)
+    column_order = [
+        "Team",
+        "Goals",
+        "xGoals (Shot+Packing)",
+        "Torschüsse",
+        "Kritische Ballverluste",
+        "Goal Threat gesamt (pxT)",
+        "Gew. Boden-Duelle",
+        "Gew. Kopfball-Duelle",
+        "Expected Passes",
+        "Bypassed Opponents (Final 3rd)",
+        "Bypassed Defenders (Low Pass)",
+        "Offensive Kontakte im letzten Drittel",
+    ]
+    return team_kpis[[column for column in column_order if column in team_kpis.columns]]
+
+
+def compute_xg_by_phase(events: pd.DataFrame) -> pd.DataFrame:
+    """Return the accumulated xG per phase for every squad."""
+
+    events = add_minutes_column(events)
+    events["phase_group"] = events["phase"].apply(map_phase)
+
+    xg_columns = [column for column in ["SHOT_XG", "PACKING_XG"] if column in events]
+    if not xg_columns:
+        return pd.DataFrame()
+
+    events["xg_total"] = events[xg_columns].sum(axis=1)
+    return (
+        events.groupby(["squadName", "phase_group"])["xg_total"].sum().reset_index()
+    )
+
+
+def compute_xg_timeline(events: pd.DataFrame) -> pd.DataFrame:
+    """Calculate the cumulative xG development over time."""
+
+    events = add_minutes_column(events)
+    xg_columns = [column for column in ["SHOT_XG", "PACKING_XG"] if column in events]
+    if not xg_columns:
+        return pd.DataFrame()
+
+    events["xg"] = events[xg_columns].sum(axis=1)
+    events = events[events["xg"] > 0].copy().sort_values("minute")
+    if events.empty:
+        return pd.DataFrame()
+
+    curves = []
+    for squad, subset in events.groupby("squadName"):
+        subset = subset.sort_values("minute")
+        subset["cum_xg"] = subset["xg"].cumsum()
+        curves.append(subset[["minute", "cum_xg", "squadName"]])
+
+    return pd.concat(curves, ignore_index=True)
+
+
+def compute_player_ratings(
+    events: pd.DataFrame, player_matchsums: List[Dict[str, float]], iteration_player_avgs: List[Dict[str, float]]
+) -> pd.DataFrame:
+    """Derive per player ratings from event level data."""
+
+    del iteration_player_avgs  # currently unused but kept for future extensions
+
+    events = events.copy()
+    required_columns = {"playerId", "playerName", "squadId", "squadName", "position"}
+    if not required_columns.issubset(events.columns):
+        missing = ", ".join(sorted(required_columns - set(events.columns)))
+        raise ValueError(f"Spalten fehlen für die Spieleraggregation: {missing}")
+
+    aggregations = {column: "sum" for column in [
+        "SHOT_XG",
+        "PACKING_XG",
+        "EXPECTED_GOAL_ASSISTS",
+        "EXPECTED_PASSES",
+        "PXT_PASS",
+        "PXT_DRIBBLE",
+        "PXT_SETPIECE",
+        "PXT_SHOT",
+        "PXT_BALL_WIN",
+        "PXT_BLOCK",
+        "WON_GROUND_DUELS",
+        "LOST_GROUND_DUELS",
+        "WON_AERIAL_DUELS",
+        "LOST_AERIAL_DUELS",
+        "CRITICAL_BALL_LOSS_NUMBER",
+        "NUMBER_OF_PRESSES",
+        "BYPASSED_OPPONENTS_DEFENDERS_RAW",
+    ] if column in events}
+
+    if not aggregations:
+        raise ValueError("Keine passenden Event-KPIs für Spieleraggregation gefunden.")
+
+    players = (
+        events.groupby(["playerId", "playerName", "squadId", "squadName", "position"]).agg(aggregations).reset_index()
+    )
+
+    players["xg"] = players.get("SHOT_XG", 0.0)
+    players["xa"] = players.get("EXPECTED_GOAL_ASSISTS", 0.0)
+    players["off_threat"] = (
+        players.get("PXT_PASS", 0.0)
+        + players.get("PXT_DRIBBLE", 0.0)
+        + players.get("PXT_SETPIECE", 0.0)
+        + players.get("PXT_SHOT", 0.0)
+        + players.get("PXT_BALL_WIN", 0.0)
+    )
+    players["neg_actions"] = (
+        players.get("LOST_GROUND_DUELS", 0.0)
+        + players.get("LOST_AERIAL_DUELS", 0.0)
+        + players.get("CRITICAL_BALL_LOSS_NUMBER", 0.0)
+    )
+    players["won_duels"] = players.get("WON_GROUND_DUELS", 0.0) + players.get("WON_AERIAL_DUELS", 0.0)
+    players["lost_duels"] = players.get("LOST_GROUND_DUELS", 0.0) + players.get("LOST_AERIAL_DUELS", 0.0)
+    players["presses"] = players.get("NUMBER_OF_PRESSES", 0.0)
+    players["def_threat"] = players.get("PXT_BLOCK", 0.0)
+
+    minutes = infer_minutes_from_matchsums(player_matchsums)
+    players = players.merge(minutes, on="playerId", how="left")
+    players["minutes"] = players["minutes"].fillna(0.0)
+
+    players["pos_group"] = players["position"].apply(group_position)
+    minutes_factor = np.minimum(players["minutes"] / 90.0, 1.0) ** 0.5
+
+    players["off_raw"] = (
+        players["xg"] * 4.0
+        + players["xa"] * 3.0
+        + players["off_threat"] * 1.0
+        - players["neg_actions"] * 0.5
+    ) * minutes_factor
+
+    players["def_raw"] = (
+        players["won_duels"] * 0.5
+        + players["presses"] * 0.1
+        + players["def_threat"] * 1.0
+        - players["lost_duels"] * 0.5
+        - players.get("CRITICAL_BALL_LOSS_NUMBER", 0.0) * 1.0
+    ) * minutes_factor
+
+    players["off_score"] = normalize_by_pos(players["off_raw"], players["pos_group"])
+    players["def_score"] = normalize_by_pos(players["def_raw"], players["pos_group"])
+    players["rating"] = (players["off_score"] * 0.6 + players["def_score"] * 0.4).clip(0, 10)
+
+    columns = [
+        "playerName",
+        "squadName",
+        "position",
+        "pos_group",
+        "minutes",
+        "xg",
+        "xa",
+        "off_threat",
+        "won_duels",
+        "lost_duels",
+        "presses",
+        "neg_actions",
+        "off_score",
+        "def_score",
+        "rating",
+    ]
+
+    return players[columns].sort_values("rating", ascending=False)
+
+
+# ---------------------------------------------------------------------------
+# Visualisation
+# ---------------------------------------------------------------------------
+
+
+def build_match_figure(
+    match_meta: Dict[str, object],
+    team_kpis: pd.DataFrame,
+    phase_xg: pd.DataFrame,
+    timeline: pd.DataFrame,
+    players: pd.DataFrame,
+) -> go.Figure:
+    """Create the final Plotly figure containing all components."""
+
+    home = match_meta.get("homeSquadName", "?")
+    away = match_meta.get("awaySquadName", "?")
+    match_day = match_meta.get("matchDayIndex", "?")
+    title = f"{home} vs {away} – Spieltag {match_day}"
+
+    colors = get_team_colors(home, away)
+
+    figure = make_subplots(
+        rows=4,
+        cols=1,
+        vertical_spacing=0.08,
+        row_heights=[0.25, 0.2, 0.3, 0.25],
+        specs=[[{"type": "bar"}], [{"type": "bar"}], [{"type": "scatter"}], [{"type": "table"}]],
+        subplot_titles=(
+            "Teamvergleich",
+            "xG nach Spielphasen (Aufbau / Konter / Pressing / Standard / Sonstige)",
+            "xG-Verlauf",
+            "Top-Spielerratings",
+        ),
+    )
+
+    team_kpis = team_kpis.copy()
+    if set(team_kpis["Team"]) == {home, away}:
+        team_kpis["sort_key"] = team_kpis["Team"].apply(lambda value: 0 if value == home else 1)
+        team_kpis = team_kpis.sort_values("sort_key").drop(columns="sort_key")
+
+    metrics = [column for column in team_kpis.columns if column != "Team"]
+    home_values = team_kpis.iloc[0][metrics].values.astype(float)
+    away_values = team_kpis.iloc[1][metrics].values.astype(float)
+
+    figure.add_trace(
+        go.Bar(x=home_values, y=metrics, orientation="h", name=home, marker_color=colors["home_main"]),
+        row=1,
+        col=1,
+    )
+    figure.add_trace(
+        go.Bar(x=away_values, y=metrics, orientation="h", name=away, marker_color=colors["away_main"]),
+        row=1,
+        col=1,
+    )
+
+    if not phase_xg.empty:
+        phases_order = ["Spielaufbau", "Konter", "Pressing / 2. Bälle", "Standard", "Sonstige"]
+        for team, color in [(home, colors["home_main"]), (away, colors["away_main"])]:
+            subset = phase_xg[phase_xg["squadName"] == team]
+            figure.add_trace(
+                go.Bar(
+                    x=phases_order,
+                    y=[subset.loc[subset["phase_group"] == phase, "xg_total"].sum() for phase in phases_order],
+                    name=team,
+                    marker_color=color,
+                ),
+                row=2,
+                col=1,
+            )
+
+    if not timeline.empty:
+        for team, color in [(home, colors["home_main"]), (away, colors["away_main"])]:
+            subset = timeline[timeline["squadName"] == team]
+            if subset.empty:
+                continue
+            figure.add_trace(
+                go.Scatter(
+                    x=subset["minute"],
+                    y=subset["cum_xg"],
+                    mode="lines+markers",
+                    name=f"{team} xG",
+                    line=dict(shape="hv", color=color),
+                ),
+                row=3,
+                col=1,
+            )
+
+    figure.update_xaxes(title_text="Minute", row=3, col=1)
+    figure.update_yaxes(title_text="xGoals", row=3, col=1)
+
+    players = players.copy().rename(
+        columns={
+            "playerName": "Playername",
+            "squadName": "Squadname",
+            "position": "Position",
+            "pos_group": "Pos Group",
+            "minutes": "Minutes",
+            "xg": "xG",
+            "xa": "xA",
+            "off_threat": "Off Threat",
+            "won_duels": "Won Duels",
+            "lost_duels": "Lost Duels",
+            "presses": "Presses",
+            "neg_actions": "Neg Actions",
+            "off_score": "Off Rating",
+            "def_score": "Def Rating",
+            "rating": "Rating",
+        }
+    )
+
+    table_columns = [
+        "Playername",
+        "Squadname",
+        "Position",
+        "Pos Group",
+        "Minutes",
+        "xG",
+        "xA",
+        "Off Threat",
+        "Won Duels",
+        "Lost Duels",
+        "Presses",
+        "Neg Actions",
+        "Off Rating",
+        "Def Rating",
+        "Rating",
+    ]
+    table_columns = [column for column in table_columns if column in players.columns]
+    players = players[table_columns].head(15)
+
+    figure.add_trace(
+        go.Table(
+            header=dict(
+                values=list(players.columns),
+                fill_color="#222222",
+                font=dict(color="white", size=11),
+                align="left",
+            ),
+            cells=dict(
+                values=[players[column].tolist() for column in players.columns],
+                fill_color="#F5F5F5",
+                align="left",
+            ),
+        ),
+        row=4,
+        col=1,
+    )
+
+    figure.update_layout(
+        title=title,
+        barmode="group",
+        height=900,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        template="plotly_white",
+    )
+    return figure
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    """Run the guided match overview workflow."""
+
+    username = USERNAME or _prompt("Benutzername (Impect): ", "")
+    password = PASSWORD or _prompt("Passwort (Impect): ", "")
+    if not username or not password:
+        raise ValueError("Es werden gültige Zugangsdaten benötigt, um das Beispiel auszuführen.")
+
+    token = get_access_token(username=username, password=password)
+    iteration_id = choose_iteration(token)
+    matchplan = get_matchplan(token, iteration_id)
+    match_id = choose_match(matchplan)
+
+    match_meta = matchplan[matchplan["id"] == match_id].iloc[0].to_dict()
+    home = match_meta.get("homeSquadName", "?")
+    away = match_meta.get("awaySquadName", "?")
+
+    print("📦 Lade Events + KPIs via impectPy.getEvents(...)")
+    events = pd.DataFrame(ip.getEvents([match_id], token=token))
+    print(f"✅ {len(events)} Events im DataFrame")
+
+    print("📦 Lade PlayerMatchsums...")
+    player_matchsums = ip.getPlayerMatchsums([match_id], token)
+    print(f"✅ {len(player_matchsums)} PlayerMatchsums-Einträge")
+
+    print("\n🧾 Hole Spieler-Stammdaten via getPlayerIterationAverages()...")
+    iteration_players = ip.getPlayerIterationAverages(iteration_id, token)
+    print(f"✅ {len(iteration_players)} Spieler-Stammdatensätze geladen.\n")
+
+    team_kpis = compute_team_kpis(events)
+    phase_xg = compute_xg_by_phase(events)
+    timeline = compute_xg_timeline(events)
+
+    print("📊 Berechne Spielerratings (Offensiv & Defensiv)...")
+    player_ratings = compute_player_ratings(events, player_matchsums, iteration_players)
+    print(player_ratings.head(20).to_string(index=False))
+
+    print("\n📈 Erzeuge Match-Übersichts-Grafik...")
+    figure = build_match_figure(match_meta, team_kpis, phase_xg, timeline, player_ratings)
+    figure.show()
+
+
+if __name__ == "__main__":
+    main()
