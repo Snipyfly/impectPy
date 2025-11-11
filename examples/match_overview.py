@@ -296,6 +296,26 @@ TEAM_KPI_LABELS: Sequence[Tuple[str, str]] = (
     ("NUMBER_OF_PRESSES_COUNTER_PRESS", "Presses – Counter Press"),
 )
 
+DUEL_METRIC_COUNTERPARTS: Dict[str, str] = {
+    "Won Ground Duels": "Lost Ground Duels",
+    "Lost Ground Duels": "Won Ground Duels",
+    "Won Aerial Duels": "Lost Aerial Duels",
+    "Lost Aerial Duels": "Won Aerial Duels",
+    "Won Duels": "Lost Duels",
+    "Lost Duels": "Won Duels",
+}
+
+
+TABLE_DESCRIPTIONS: Dict[str, str] = {
+    "Spielerratings": "Individuelle Match-Leistung inkl. Offensiv-/Defensiv-Rating und Kernactions.",
+    "Player Match Scores": "Modelbasierte Match-Scores (pxT, Packing usw.) für jeden Spieler.",
+    "Player Profile Scores": "Profil-basierte Leistungswerte im Vergleich zur Positionsanforderung.",
+    "Squad Match Scores": "Teamweite Match-KPIs aus pxT-, Packing- und Pressing-Daten.",
+    "Squad Ratings": "Letzter Rating-Stand der Teams vor dem Spiel (ELO/Power-Ranking).",
+    "Squad Coefficients": "Prädiktive Koeffizienten für Angriff, Defensive und Heimvorteil.",
+    "Set Piece Übersicht": "Standard-Situationen nach xG-Anteil und Anzahl je Kategorie.",
+}
+
 
 def most_common_value(values: pd.Series, default: str = "Unknown") -> str:
     """Return the mode of ``values`` with graceful fallbacks."""
@@ -334,6 +354,48 @@ def select_top_numeric_columns(
     return numeric_columns[:limit]
 
 
+def format_absolute_value(value: float) -> str:
+    """Return a compact string representation for numeric values."""
+
+    if pd.isna(value):
+        return ""
+
+    value = float(value)
+    magnitude = abs(value)
+    if magnitude >= 100:
+        formatted = f"{value:.0f}"
+    elif magnitude >= 10:
+        formatted = f"{value:.1f}"
+    elif magnitude >= 1:
+        formatted = f"{value:.2f}"
+    else:
+        formatted = f"{value:.2f}"
+
+    formatted = formatted.rstrip("0").rstrip(".")
+    return formatted or "0"
+
+
+def extract_team_logo(match_meta: Dict[str, object], side: str) -> Optional[str]:
+    """Return a logo URL or data URI for the requested team if available."""
+
+    side = side.lower()
+    candidates = []
+    for key, value in match_meta.items():
+        if not isinstance(value, str) or not value:
+            continue
+        lower_key = key.lower()
+        if "logo" not in lower_key:
+            continue
+        if side in lower_key or lower_key.startswith(side):
+            candidates.append(value)
+
+    if candidates:
+        # prefer https URLs over others, fallback to first entry
+        https_candidates = [value for value in candidates if value.startswith("https://")]
+        return https_candidates[0] if https_candidates else candidates[0]
+    return None
+
+
 def prepare_table(
     dataframe: Optional[pd.DataFrame],
     base_columns: Sequence[str],
@@ -341,6 +403,7 @@ def prepare_table(
     numeric_limit: int = 3,
     top_n: int = 10,
     sort_by: Optional[str] = None,
+    dedupe_on: Optional[Sequence[str]] = None,
 ) -> pd.DataFrame:
     """Return a compact table with the selected columns formatted for display."""
 
@@ -348,6 +411,11 @@ def prepare_table(
         return pd.DataFrame()
 
     df = dataframe.copy()
+
+    if dedupe_on:
+        keys = [column for column in dedupe_on if column in df.columns]
+        if keys:
+            df = df.sort_values(keys).drop_duplicates(keys, keep="last")
     selected: List[str] = [column for column in base_columns if column in df.columns]
 
     if extra_candidates:
@@ -398,6 +466,7 @@ def summarise_player_scores(player_scores: Optional[pd.DataFrame], match_id: int
         base_columns=["playerName", "squadName"],
         extra_candidates=["position", "positions", "matchShare", "playDuration"],
         numeric_limit=4,
+        dedupe_on=["playerId", "playerName", "squadName"],
     )
 
 
@@ -420,6 +489,7 @@ def summarise_player_profile_scores(
         base_columns=["playerName", "squadName"],
         extra_candidates=["positions", "matchShare", "playDuration"],
         numeric_limit=4,
+        dedupe_on=["playerId", "playerName", "squadName"],
     )
 
 
@@ -440,6 +510,7 @@ def summarise_squad_scores(squad_scores: Optional[pd.DataFrame], match_id: int) 
         extra_candidates=["matchShare", "playDuration"],
         numeric_limit=4,
         top_n=4,
+        dedupe_on=["squadId", "squadName"],
     )
 
 
@@ -490,6 +561,7 @@ def summarise_squad_ratings(
         extra_candidates=["value"],
         numeric_limit=1,
         top_n=4,
+        dedupe_on=["squadId", "squadName"],
     )
 
 
@@ -533,6 +605,7 @@ def summarise_squad_coefficients(
         ],
         numeric_limit=4,
         top_n=4,
+        dedupe_on=["squadId", "squadName"],
     )
 
 
@@ -806,6 +879,7 @@ def compute_team_kpis(events: pd.DataFrame) -> pd.DataFrame:
     groups = events.groupby(["squadId", "squadName"])
 
     rows = []
+    absolute_metrics: Dict[str, Dict[str, float]] = {}
     for (_squad_id, squad_name), subset in groups:
         row: Dict[str, float] = {"Team": squad_name}
 
@@ -815,12 +889,19 @@ def compute_team_kpis(events: pd.DataFrame) -> pd.DataFrame:
             row["Goals"] = subset["score"].diff().clip(lower=0).sum()
         else:
             row["Goals"] = np.nan
+        if not pd.isna(row["Goals"]):
+            absolute_metrics.setdefault("Goals", {})[squad_name] = float(row["Goals"])
 
         shot_xg = subset.get("SHOT_XG", pd.Series(dtype=float)).sum()
         packing_xg = subset.get("PACKING_XG", pd.Series(dtype=float)).sum()
         row["Shot-based xG"] = shot_xg
         row["Packing xG"] = packing_xg
         row["xGoals (Shot+Packing)"] = shot_xg + packing_xg
+        absolute_metrics.setdefault("Shot-based xG", {})[squad_name] = float(shot_xg)
+        absolute_metrics.setdefault("Packing xG", {})[squad_name] = float(packing_xg)
+        absolute_metrics.setdefault("xGoals (Shot+Packing)", {})[squad_name] = float(
+            row["xGoals (Shot+Packing)"]
+        )
 
         pxt_columns = [
             column
@@ -837,22 +918,71 @@ def compute_team_kpis(events: pd.DataFrame) -> pd.DataFrame:
         row["Goal Threat gesamt (pxT)"] = (
             subset[pxt_columns].sum(axis=1).sum() if pxt_columns else np.nan
         )
+        if not pd.isna(row["Goal Threat gesamt (pxT)"]):
+            absolute_metrics.setdefault("Goal Threat gesamt (pxT)", {})[squad_name] = float(
+                row["Goal Threat gesamt (pxT)"]
+            )
 
         for column, label in TEAM_KPI_LABELS:
             if column == "GOALS":
                 continue
             if column in subset:
-                row[label] = subset[column].sum()
+                value = subset[column].sum()
+                row[label] = value
+                absolute_metrics.setdefault(label, {})[squad_name] = float(value)
 
         if "OFFENSIVE_TOUCHES_IN_PITCH_POSITION_FINAL_THIRD" in subset:
             row.setdefault(
                 "Offensive Touches – Final Third",
                 subset["OFFENSIVE_TOUCHES_IN_PITCH_POSITION_FINAL_THIRD"].sum(),
             )
+            absolute_metrics.setdefault("Offensive Touches – Final Third", {})[squad_name] = float(
+                row["Offensive Touches – Final Third"]
+            )
+
+        duel_pairs = [
+            ("Won Ground Duels", "Lost Ground Duels"),
+            ("Won Aerial Duels", "Lost Aerial Duels"),
+            ("Won Duels", "Lost Duels"),
+        ]
+        for won_label, lost_label in duel_pairs:
+            won = float(row.get(won_label, np.nan))
+            lost = float(row.get(lost_label, np.nan))
+            total = 0.0
+            if not np.isnan(won):
+                absolute_metrics.setdefault(won_label, {})[squad_name] = won
+                total += won
+            if not np.isnan(lost):
+                absolute_metrics.setdefault(lost_label, {})[squad_name] = lost
+                total += lost
+            if total > 0:
+                if won_label in row and not np.isnan(won):
+                    row[won_label] = won / total
+                if lost_label in row and not np.isnan(lost):
+                    row[lost_label] = lost / total
+
+        if "Number of Presses" in row:
+            presses_value = row["Number of Presses"]
+        else:
+            presses_value = np.nan
+        if (pd.isna(presses_value) or presses_value == 0) and (
+            "pressingPlayerId" in subset.columns or "pressingTeamId" in subset.columns
+        ):
+            press_mask = pd.Series(True, index=subset.index)
+            if "pressingPlayerId" in subset.columns:
+                press_mask &= subset["pressingPlayerId"].notna()
+            if "pressingTeamId" in subset.columns:
+                press_mask &= subset["pressingTeamId"].notna()
+            presses_fallback = int(press_mask.sum())
+            if presses_fallback > 0:
+                row["Number of Presses"] = float(presses_fallback)
+        if "Number of Presses" in row:
+            absolute_metrics.setdefault("Number of Presses", {})[squad_name] = row["Number of Presses"]
 
         rows.append(row)
 
     team_kpis = pd.DataFrame(rows)
+    team_kpis.attrs["absolute_metrics"] = absolute_metrics
     column_order = [
         "Team",
         "Goals",
@@ -1288,6 +1418,12 @@ def build_match_figure(
     else:
         row_heights = base_row_heights
 
+    def format_subplot_title(title_text: str) -> str:
+        for key, description in TABLE_DESCRIPTIONS.items():
+            if title_text.startswith(key):
+                return f"{title_text}<br><sup>{description}</sup>"
+        return title_text
+
     subplot_titles = [
         "Teamvergleich",
         "xG nach Spielphasen (Aufbau / Konter / Pressing / Standard / Sonstige)",
@@ -1295,7 +1431,7 @@ def build_match_figure(
     if has_set_piece_chart:
         subplot_titles.append("Set Piece xG-Anteile")
     subplot_titles.append("xG-Verlauf")
-    subplot_titles.extend(title for title, _ in table_sections)
+    subplot_titles.extend(format_subplot_title(title) for title, _ in table_sections)
 
     chart_types: List[str] = ["bar", "bar"]
     if has_set_piece_chart:
@@ -1321,60 +1457,125 @@ def build_match_figure(
         subplot_titles=tuple(subplot_titles),
     )
 
+    abs_metrics = team_kpis.attrs.get("absolute_metrics", {})
     team_kpis = team_kpis.copy()
+    team_kpis.attrs["absolute_metrics"] = abs_metrics
     if set(team_kpis["Team"]) == {home, away}:
         team_kpis["sort_key"] = team_kpis["Team"].apply(lambda value: 0 if value == home else 1)
         team_kpis = team_kpis.sort_values("sort_key").drop(columns="sort_key")
 
     metrics = [column for column in team_kpis.columns if column != "Team"]
-    home_values = pd.to_numeric(team_kpis.iloc[0][metrics], errors="coerce").to_numpy(dtype=float)
-    away_values = pd.to_numeric(team_kpis.iloc[1][metrics], errors="coerce").to_numpy(dtype=float)
-    totals = home_values + away_values
+    home_share_values: List[float] = []
+    away_share_values: List[float] = []
+    home_text: List[str] = []
+    away_text: List[str] = []
+    home_hover: List[str] = []
+    away_hover: List[str] = []
 
-    with np.errstate(divide="ignore", invalid="ignore"):
-        home_share = np.divide(home_values, totals, out=np.zeros_like(home_values), where=totals != 0)
-        away_share = np.divide(away_values, totals, out=np.zeros_like(away_values), where=totals != 0)
+    for metric in metrics:
+        home_abs = abs_metrics.get(metric, {}).get(home, np.nan)
+        away_abs = abs_metrics.get(metric, {}).get(away, np.nan)
 
-    home_custom = np.column_stack([home_values, totals])
-    away_custom = np.column_stack([away_values, totals])
+        if pd.isna(home_abs):
+            home_abs = pd.to_numeric(team_kpis.iloc[0].get(metric, np.nan), errors="coerce")
+        if pd.isna(away_abs):
+            away_abs = pd.to_numeric(team_kpis.iloc[1].get(metric, np.nan), errors="coerce")
 
-    home_text = [f"{value:.0%}" if total > 0 else "" for value, total in zip(home_share, totals)]
-    away_text = [f"{value:.0%}" if total > 0 else "" for value, total in zip(away_share, totals)]
+        home_value = float(home_abs) if not pd.isna(home_abs) else 0.0
+        away_value = float(away_abs) if not pd.isna(away_abs) else 0.0
+
+        counterpart = DUEL_METRIC_COUNTERPARTS.get(metric)
+        if counterpart:
+            home_counter = abs_metrics.get(counterpart, {}).get(home, np.nan)
+            away_counter = abs_metrics.get(counterpart, {}).get(away, np.nan)
+            home_total = home_value + float(home_counter) if not pd.isna(home_counter) else home_value
+            away_total = away_value + float(away_counter) if not pd.isna(away_counter) else away_value
+            home_share = home_value / home_total if home_total > 0 else 0.0
+            away_share = away_value / away_total if away_total > 0 else 0.0
+            home_denominator = home_total
+            away_denominator = away_total
+            home_hover.append(
+                "<b>{metric}</b><br>{team}: {value} von {total} Aktionen<br>Quote: {share}".format(
+                    metric=metric,
+                    team=home,
+                    value=format_absolute_value(home_abs),
+                    total=format_absolute_value(home_denominator),
+                    share=f"{home_share:.0%}",
+                )
+                if home_denominator > 0
+                else f"<b>{metric}</b><br>{home}: Keine Daten"
+            )
+            away_hover.append(
+                "<b>{metric}</b><br>{team}: {value} von {total} Aktionen<br>Quote: {share}".format(
+                    metric=metric,
+                    team=away,
+                    value=format_absolute_value(away_abs),
+                    total=format_absolute_value(away_denominator),
+                    share=f"{away_share:.0%}",
+                )
+                if away_denominator > 0
+                else f"<b>{metric}</b><br>{away}: Keine Daten"
+            )
+        else:
+            total = home_value + away_value
+            home_share = home_value / total if total > 0 else 0.0
+            away_share = away_value / total if total > 0 else 0.0
+            home_denominator = total
+            away_denominator = total
+            home_hover.append(
+                "<b>{metric}</b><br>{team}: {value}<br>Gesamt: {total_value}<br>Anteil: {share}".format(
+                    metric=metric,
+                    team=home,
+                    value=format_absolute_value(home_abs),
+                    total_value=format_absolute_value(home_denominator),
+                    share=f"{home_share:.0%}",
+                )
+                if total > 0
+                else f"<b>{metric}</b><br>{home}: Keine Daten"
+            )
+            away_hover.append(
+                "<b>{metric}</b><br>{team}: {value}<br>Gesamt: {total_value}<br>Anteil: {share}".format(
+                    metric=metric,
+                    team=away,
+                    value=format_absolute_value(away_abs),
+                    total_value=format_absolute_value(away_denominator),
+                    share=f"{away_share:.0%}",
+                )
+                if total > 0
+                else f"<b>{metric}</b><br>{away}: Keine Daten"
+            )
+
+        home_share_values.append(home_share)
+        away_share_values.append(away_share)
+        home_text.append(format_absolute_value(home_abs))
+        away_text.append(format_absolute_value(away_abs))
 
     figure.add_trace(
         go.Bar(
-            x=home_share,
+            x=home_share_values,
             y=metrics,
             orientation="h",
             name=home,
             marker_color=colors["home_main"],
-            customdata=home_custom,
             text=home_text,
             textposition="inside",
-            hovertemplate=(
-                "<b>%{y}</b><br>"
-                f"{home}: %{{customdata[0]:.2f}}<br>Gesamt: %{{customdata[1]:.2f}}<br>"
-                "Anteil: %{x:.0%}<extra></extra>"
-            ),
+            hovertext=home_hover,
+            hovertemplate="%{hovertext}<extra></extra>",
         ),
         row=1,
         col=1,
     )
     figure.add_trace(
         go.Bar(
-            x=away_share,
+            x=away_share_values,
             y=metrics,
             orientation="h",
             name=away,
             marker_color=colors["away_main"],
-            customdata=away_custom,
             text=away_text,
             textposition="inside",
-            hovertemplate=(
-                "<b>%{y}</b><br>"
-                f"{away}: %{{customdata[0]:.2f}}<br>Gesamt: %{{customdata[1]:.2f}}<br>"
-                "Anteil: %{x:.0%}<extra></extra>"
-            ),
+            hovertext=away_hover,
+            hovertemplate="%{hovertext}<extra></extra>",
         ),
         row=1,
         col=1,
@@ -1416,11 +1617,36 @@ def build_match_figure(
                     away_phase_values, totals_phase, out=np.zeros_like(away_phase_values), where=totals_phase != 0
                 )
 
-            home_phase_custom = np.column_stack([home_phase_values, totals_phase])
-            away_phase_custom = np.column_stack([away_phase_values, totals_phase])
-
-            home_phase_text = [f"{value:.0%}" if total > 0 else "" for value, total in zip(home_phase_share, totals_phase)]
-            away_phase_text = [f"{value:.0%}" if total > 0 else "" for value, total in zip(away_phase_share, totals_phase)]
+            home_phase_text = [format_absolute_value(value) for value in home_phase_values]
+            away_phase_text = [format_absolute_value(value) for value in away_phase_values]
+            home_phase_hover = [
+                (
+                    "<b>{phase}</b><br>{team}: {value} xG<br>Gesamt: {total} xG<br>Anteil: {share}".format(
+                        phase=phase,
+                        team=home,
+                        value=format_absolute_value(value),
+                        total=format_absolute_value(total),
+                        share=f"{share:.0%}",
+                    )
+                )
+                if total > 0
+                else f"<b>{phase}</b><br>{home}: Keine xG-Daten"
+                for phase, value, total, share in zip(phases, home_phase_values, totals_phase, home_phase_share)
+            ]
+            away_phase_hover = [
+                (
+                    "<b>{phase}</b><br>{team}: {value} xG<br>Gesamt: {total} xG<br>Anteil: {share}".format(
+                        phase=phase,
+                        team=away,
+                        value=format_absolute_value(value),
+                        total=format_absolute_value(total),
+                        share=f"{share:.0%}",
+                    )
+                )
+                if total > 0
+                else f"<b>{phase}</b><br>{away}: Keine xG-Daten"
+                for phase, value, total, share in zip(phases, away_phase_values, totals_phase, away_phase_share)
+            ]
 
             figure.add_trace(
                 go.Bar(
@@ -1429,14 +1655,10 @@ def build_match_figure(
                     orientation="h",
                     name=f"{home} xG-Anteil",
                     marker_color=colors["home_main"],
-                    customdata=home_phase_custom,
                     text=home_phase_text,
                     textposition="inside",
-                    hovertemplate=(
-                        "<b>%{y}</b><br>"
-                        f"{home}: %{{customdata[0]:.2f}} xG<br>Gesamt: %{{customdata[1]:.2f}} xG<br>"
-                        "Anteil: %{x:.0%}<extra></extra>"
-                    ),
+                    hovertext=home_phase_hover,
+                    hovertemplate="%{hovertext}<extra></extra>",
                 ),
                 row=2,
                 col=1,
@@ -1448,14 +1670,10 @@ def build_match_figure(
                     orientation="h",
                     name=f"{away} xG-Anteil",
                     marker_color=colors["away_main"],
-                    customdata=away_phase_custom,
                     text=away_phase_text,
                     textposition="inside",
-                    hovertemplate=(
-                        "<b>%{y}</b><br>"
-                        f"{away}: %{{customdata[0]:.2f}} xG<br>Gesamt: %{{customdata[1]:.2f}} xG<br>"
-                        "Anteil: %{x:.0%}<extra></extra>"
-                    ),
+                    hovertext=away_phase_hover,
+                    hovertemplate="%{hovertext}<extra></extra>",
                 ),
                 row=2,
                 col=1,
@@ -1512,11 +1730,53 @@ def build_match_figure(
                     away_set_piece, totals_xg, out=np.zeros_like(away_set_piece), where=totals_xg != 0
                 )
 
-            home_custom = np.column_stack([home_set_piece, totals_xg, home_counts, totals_counts])
-            away_custom = np.column_stack([away_set_piece, totals_xg, away_counts, totals_counts])
+            home_text = [
+                f"{format_absolute_value(xg)} xG | {format_absolute_value(count)}"
+                for xg, count in zip(home_set_piece, home_counts)
+            ]
+            away_text = [
+                f"{format_absolute_value(xg)} xG | {format_absolute_value(count)}"
+                for xg, count in zip(away_set_piece, away_counts)
+            ]
 
-            home_text = [f"{value:.0%}" if total > 0 else "" for value, total in zip(home_share, totals_xg)]
-            away_text = [f"{value:.0%}" if total > 0 else "" for value, total in zip(away_share, totals_xg)]
+            home_hover = [
+                (
+                    "<b>{category}</b><br>{team}: {xg} xG | {count} Aktionen<br>"
+                    "Gesamt: {total_xg} xG | {total_count} Aktionen<br>Anteil: {share}".format(
+                        category=category,
+                        team=home,
+                        xg=format_absolute_value(xg),
+                        count=format_absolute_value(count),
+                        total_xg=format_absolute_value(total_xg),
+                        total_count=format_absolute_value(total_count),
+                        share=f"{share:.0%}",
+                    )
+                )
+                if total_xg > 0 or total_count > 0
+                else f"<b>{category}</b><br>{home}: Keine Set-Piece-Daten"
+                for category, xg, count, total_xg, total_count, share in zip(
+                    categories, home_set_piece, home_counts, totals_xg, totals_counts, home_share
+                )
+            ]
+            away_hover = [
+                (
+                    "<b>{category}</b><br>{team}: {xg} xG | {count} Aktionen<br>"
+                    "Gesamt: {total_xg} xG | {total_count} Aktionen<br>Anteil: {share}".format(
+                        category=category,
+                        team=away,
+                        xg=format_absolute_value(xg),
+                        count=format_absolute_value(count),
+                        total_xg=format_absolute_value(total_xg),
+                        total_count=format_absolute_value(total_count),
+                        share=f"{share:.0%}",
+                    )
+                )
+                if total_xg > 0 or total_count > 0
+                else f"<b>{category}</b><br>{away}: Keine Set-Piece-Daten"
+                for category, xg, count, total_xg, total_count, share in zip(
+                    categories, away_set_piece, away_counts, totals_xg, totals_counts, away_share
+                )
+            ]
 
             figure.add_trace(
                 go.Bar(
@@ -1525,15 +1785,10 @@ def build_match_figure(
                     orientation="h",
                     name=f"{home} Set Pieces",
                     marker_color=colors["home_main"],
-                    customdata=home_custom,
                     text=home_text,
                     textposition="inside",
-                    hovertemplate=(
-                        "<b>%{y}</b><br>"
-                        f"{home}: %{{customdata[0]:.2f}} xG | %{{customdata[2]:.0f}} Aktionen<br>"
-                        "Gesamt: %{customdata[1]:.2f} xG | %{customdata[3]:.0f} Aktionen<br>"
-                        "Anteil: %{x:.0%}<extra></extra>"
-                    ),
+                    hovertext=home_hover,
+                    hovertemplate="%{hovertext}<extra></extra>",
                 ),
                 row=set_piece_row,
                 col=1,
@@ -1545,15 +1800,10 @@ def build_match_figure(
                     orientation="h",
                     name=f"{away} Set Pieces",
                     marker_color=colors["away_main"],
-                    customdata=away_custom,
                     text=away_text,
                     textposition="inside",
-                    hovertemplate=(
-                        "<b>%{y}</b><br>"
-                        f"{away}: %{{customdata[0]:.2f}} xG | %{{customdata[2]:.0f}} Aktionen<br>"
-                        "Gesamt: %{customdata[1]:.2f} xG | %{customdata[3]:.0f} Aktionen<br>"
-                        "Anteil: %{x:.0%}<extra></extra>"
-                    ),
+                    hovertext=away_hover,
+                    hovertemplate="%{hovertext}<extra></extra>",
                 ),
                 row=set_piece_row,
                 col=1,
@@ -1611,12 +1861,51 @@ def build_match_figure(
 
     figure.update_layout(
         title=title,
-        barmode="group",
-        height=8000,  # fixe Höhe, nicht mehr + sum(...)
+        barmode="stack",
+        height=7800,
         width=1500,
-        legend=dict(orientation="h", yanchor="bottom", y=1.2, xanchor="right", x=1),
+        legend=dict(orientation="h", yanchor="bottom", y=1.08, xanchor="right", x=1),
+        margin=dict(t=80, r=60, l=80, b=80),
         template="plotly_white",
     )
+
+    home_logo = extract_team_logo(match_meta, "home")
+    away_logo = extract_team_logo(match_meta, "away")
+    logo_size = 0.12
+    logo_y = 1.12
+
+    if home_logo:
+        figure.add_layout_image(
+            dict(
+                source=home_logo,
+                xref="paper",
+                yref="paper",
+                x=0.02,
+                y=logo_y,
+                sizex=logo_size,
+                sizey=logo_size,
+                xanchor="left",
+                yanchor="bottom",
+                sizing="contain",
+                layer="above",
+            )
+        )
+    if away_logo:
+        figure.add_layout_image(
+            dict(
+                source=away_logo,
+                xref="paper",
+                yref="paper",
+                x=0.98,
+                y=logo_y,
+                sizex=logo_size,
+                sizey=logo_size,
+                xanchor="right",
+                yanchor="bottom",
+                sizing="contain",
+                layer="above",
+            )
+        )
     return figure
 
 
