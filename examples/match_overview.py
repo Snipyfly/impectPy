@@ -433,6 +433,18 @@ def compute_player_ratings(
     del iteration_player_avgs  # currently unused but kept for future extensions
 
     events = events.copy()
+
+    if "position" not in events.columns:
+        position_aliases = [
+            "playerPosition",
+            "player_position",
+            "positionName",
+        ]
+        for alias in position_aliases:
+            if alias in events.columns:
+                events["position"] = events[alias]
+                break
+
     required_columns = {"playerId", "playerName", "squadId", "squadName", "position"}
     if not required_columns.issubset(events.columns):
         missing = ", ".join(sorted(required_columns - set(events.columns)))
