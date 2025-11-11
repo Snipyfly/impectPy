@@ -471,9 +471,17 @@ def summarise_squad_ratings(
 
     filtered = filtered.copy()
     if "date" in filtered.columns and match_date is not None:
-        filtered["date_ts"] = pd.to_datetime(filtered["date"], errors="coerce")
+        filtered["date_ts"] = pd.to_datetime(filtered["date"], errors="coerce", utc=True)
         filtered = filtered[filtered["date_ts"].notna()]
-        filtered = filtered[filtered["date_ts"] <= match_date]
+
+        filtered["date_ts"] = filtered["date_ts"].dt.tz_localize(None)
+        match_cutoff = (
+            match_date.tz_localize(None)
+            if getattr(match_date, "tzinfo", None) is not None
+            else match_date
+        )
+
+        filtered = filtered[filtered["date_ts"] <= match_cutoff]
         filtered = filtered.sort_values("date_ts", ascending=False).drop_duplicates("squadId")
 
     return prepare_table(
@@ -501,9 +509,17 @@ def summarise_squad_coefficients(
 
     filtered = filtered.copy()
     if "date" in filtered.columns and match_date is not None:
-        filtered["date_ts"] = pd.to_datetime(filtered["date"], errors="coerce")
+        filtered["date_ts"] = pd.to_datetime(filtered["date"], errors="coerce", utc=True)
         filtered = filtered[filtered["date_ts"].notna()]
-        filtered = filtered[filtered["date_ts"] <= match_date]
+
+        filtered["date_ts"] = filtered["date_ts"].dt.tz_localize(None)
+        match_cutoff = (
+            match_date.tz_localize(None)
+            if getattr(match_date, "tzinfo", None) is not None
+            else match_date
+        )
+
+        filtered = filtered[filtered["date_ts"] <= match_cutoff]
         filtered = filtered.sort_values("date_ts", ascending=False).drop_duplicates("squadId")
 
     return prepare_table(
