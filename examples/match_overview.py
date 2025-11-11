@@ -375,7 +375,7 @@ def prepare_table(
 
     numeric_subset = [column for column in table.columns if is_numeric_dtype(table[column])]
     if numeric_subset:
-        table[numeric_subset] = table[numeric_subset].applymap(
+        table[numeric_subset] = table[numeric_subset].map(
             lambda value: round(float(value), 2) if pd.notna(value) else np.nan
         )
 
@@ -1228,7 +1228,7 @@ def build_match_figure(
 
         numeric_columns = [column for column in subset.columns if is_numeric_dtype(subset[column])]
         if numeric_columns:
-            subset[numeric_columns] = subset[numeric_columns].applymap(
+            subset[numeric_columns] = subset[numeric_columns].map(
                 lambda value: round(float(value), 2) if pd.notna(value) else np.nan
             )
 
@@ -1304,11 +1304,20 @@ def build_match_figure(
     subplot_titles.append("xG-Verlauf")
     subplot_titles.extend(title for title, _ in table_sections)
 
-    specs: List[List[Dict[str, str]]] = [[{"type": "bar"}], [{"type": "bar"}]]
+    chart_types: List[str] = ["bar", "bar"]
     if has_set_piece_chart:
-        specs.append([{"type": "bar"}])
-    specs.append([{"type": "scatter"}])
-    specs.extend([[{"type": "table"}] for _ in table_sections])
+        chart_types.append("bar")
+    chart_types.append("scatter")
+    chart_types.extend(["table"] * num_tables)
+
+    if len(chart_types) != total_rows:
+        raise ValueError(
+            "Interne Konsistenzprüfung fehlgeschlagen: Anzahl der Subplot-Typen "
+            f"({len(chart_types)}) stimmt nicht mit der erwarteten Anzahl an Zeilen "
+            f"({total_rows}) überein."
+        )
+
+    specs: List[List[Dict[str, str]]] = [[{"type": chart_type}] for chart_type in chart_types]
 
     figure = make_subplots(
         rows=total_rows,
