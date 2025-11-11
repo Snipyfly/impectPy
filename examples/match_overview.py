@@ -31,12 +31,14 @@ timeline and individual player ratings.
 from __future__ import annotations
 
 import os
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+from pandas.api.types import is_datetime64_any_dtype, is_numeric_dtype
 
 import impectPy as ip
 
@@ -47,6 +49,18 @@ import impectPy as ip
 USERNAME = os.getenv("IMPLECT_USERNAME", "")
 PASSWORD = os.getenv("IMPLECT_PASSWORD", "")
 DEFAULT_SEASON = "25/26"
+DEFAULT_PROFILE_POSITIONS = [
+    "GOALKEEPER",
+    "LEFT_WINGBACK_DEFENDER",
+    "RIGHT_WINGBACK_DEFENDER",
+    "CENTRAL_DEFENDER",
+    "DEFENSE_MIDFIELD",
+    "CENTRAL_MIDFIELD",
+    "ATTACKING_MIDFIELD",
+    "LEFT_WINGER",
+    "RIGHT_WINGER",
+    "CENTER_FORWARD",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +210,442 @@ def add_minutes_column(events: pd.DataFrame) -> pd.DataFrame:
     return events
 
 
+TEAM_KPI_LABELS: Sequence[Tuple[str, str]] = (
+    ("GOALS", "Goals"),
+    ("SHOT_XG", "Shot-based xG"),
+    ("PACKING_XG", "Packing xG"),
+    ("POSTSHOT_XG", "Post-shot xG"),
+    ("SHOT_AT_GOAL_NUMBER", "Total Shots"),
+    ("CRITICAL_BALL_LOSS_NUMBER", "Critical Ball Losses"),
+    ("WON_GROUND_DUELS", "Won Ground Duels"),
+    ("LOST_GROUND_DUELS", "Lost Ground Duels"),
+    ("WON_AERIAL_DUELS", "Won Aerial Duels"),
+    ("LOST_AERIAL_DUELS", "Lost Aerial Duels"),
+    ("EXPECTED_PASSES", "Expected Passes"),
+    ("BYPASSED_OPPONENTS_RAW", "Bypassed Opponents (raw)"),
+    ("BYPASSED_DEFENDERS_RAW", "Bypassed Defenders (raw)"),
+    ("BYPASSED_OPPONENTS_TO_PITCH_POSITION_FINAL_THIRD", "Bypassed Opponents – Final Third"),
+    ("BYPASSED_OPPONENTS_NUMBER_TO_PITCH_POSITION_FINAL_THIRD", "Bypassed Opponent Actions – Final Third"),
+    ("BYPASSED_OPPONENTS_NUMBER_TO_PITCH_POSITION_OPPONENT_BOX", "Bypassed Opponent Actions – Opponent Box"),
+    ("BYPASSED_DEFENDERS_BY_ACTION_LOW_PASS", "Bypassed Defenders – Low Pass"),
+    ("BYPASSED_DEFENDERS_BY_ACTION_DIAGONAL_PASS", "Bypassed Defenders – Diagonal Pass"),
+    ("BYPASSED_DEFENDERS_BY_ACTION_CHIPPED_PASS", "Bypassed Defenders – Chipped Pass"),
+    ("BYPASSED_DEFENDERS_BY_ACTION_SHORT_AERIAL_PASS", "Bypassed Defenders – Short Aerial Pass"),
+    ("BYPASSED_DEFENDERS_BY_ACTION_LOW_CROSS", "Bypassed Defenders – Low Cross"),
+    ("BYPASSED_DEFENDERS_BY_ACTION_HIGH_CROSS", "Bypassed Defenders – High Cross"),
+    ("BYPASSED_DEFENDERS_BY_ACTION_CLEARANCE", "Bypassed Defenders – Clearance"),
+    ("BYPASSED_DEFENDERS_BY_ACTION_HEADER", "Bypassed Defenders – Header"),
+    ("BYPASSED_DEFENDERS_BY_ACTION_BLOCK", "Bypassed Defenders – Block"),
+    ("BYPASSED_DEFENDERS_BY_ACTION_SAVE", "Bypassed Defenders – Save"),
+    ("BYPASSED_DEFENDERS_BY_ACTION_GOAL_KICK", "Bypassed Defenders – Goal Kick"),
+    ("BYPASSED_DEFENDERS_BY_ACTION_THROW_IN", "Bypassed Defenders – Throw-in"),
+    ("BYPASSED_DEFENDERS_BY_ACTION_CORNER", "Bypassed Defenders – Corner"),
+    ("BYPASSED_DEFENDERS_BY_ACTION_FREE_KICK", "Bypassed Defenders – Free Kick"),
+    ("BYPASSED_OPPONENTS_NUMBER_BY_ACTION_LOW_PASS", "Bypassed Opponent Actions – Low Pass"),
+    ("BYPASSED_OPPONENTS_NUMBER_BY_ACTION_DIAGONAL_PASS", "Bypassed Opponent Actions – Diagonal Pass"),
+    ("BYPASSED_OPPONENTS_NUMBER_BY_ACTION_CHIPPED_PASS", "Bypassed Opponent Actions – Chipped Pass"),
+    ("BYPASSED_OPPONENTS_NUMBER_BY_ACTION_SHORT_AERIAL_PASS", "Bypassed Opponent Actions – Short Aerial Pass"),
+    ("BYPASSED_OPPONENTS_NUMBER_BY_ACTION_LOW_CROSS", "Bypassed Opponent Actions – Low Cross"),
+    ("BYPASSED_OPPONENTS_NUMBER_BY_ACTION_HIGH_CROSS", "Bypassed Opponent Actions – High Cross"),
+    ("BYPASSED_OPPONENTS_NUMBER_BY_ACTION_CLEARANCE", "Bypassed Opponent Actions – Clearance"),
+    ("BYPASSED_OPPONENTS_NUMBER_BY_ACTION_HEADER", "Bypassed Opponent Actions – Header"),
+    ("BYPASSED_OPPONENTS_NUMBER_BY_ACTION_BLOCK", "Bypassed Opponent Actions – Block"),
+    ("BYPASSED_OPPONENTS_NUMBER_BY_ACTION_SAVE", "Bypassed Opponent Actions – Save"),
+    ("BYPASSED_OPPONENTS_NUMBER_BY_ACTION_GOAL_KICK", "Bypassed Opponent Actions – Goal Kick"),
+    ("BYPASSED_OPPONENTS_NUMBER_BY_ACTION_THROW_IN", "Bypassed Opponent Actions – Throw-in"),
+    ("BYPASSED_OPPONENTS_NUMBER_BY_ACTION_CORNER", "Bypassed Opponent Actions – Corner"),
+    ("BYPASSED_OPPONENTS_NUMBER_BY_ACTION_FREE_KICK", "Bypassed Opponent Actions – Free Kick"),
+    ("BYPASSED_OPPONENTS_NUMBER_TO_PITCH_POSITION_FIRST_THIRD", "Bypassed Opponent Actions – First Third"),
+    ("BYPASSED_OPPONENTS_NUMBER_TO_PITCH_POSITION_MIDDLE_THIRD", "Bypassed Opponent Actions – Middle Third"),
+    ("BYPASSED_OPPONENTS_NUMBER_TO_PITCH_POSITION_FINAL_THIRD", "Bypassed Opponent Actions – Final Third"),
+    ("BYPASSED_OPPONENTS_NUMBER_TO_PITCH_POSITION_OPPONENT_BOX", "Bypassed Opponent Actions – Opponent Box"),
+    ("SUCCESSFUL_PASSES_TO_PITCH_POSITION_FIRST_THIRD", "Successful Passes – First Third"),
+    ("SUCCESSFUL_PASSES_TO_PITCH_POSITION_MIDDLE_THIRD", "Successful Passes – Middle Third"),
+    ("SUCCESSFUL_PASSES_TO_PITCH_POSITION_FINAL_THIRD", "Successful Passes – Final Third"),
+    ("SUCCESSFUL_PASSES_TO_PITCH_POSITION_OPPONENT_BOX", "Successful Passes – Opponent Box"),
+    ("OFFENSIVE_TOUCHES_IN_PITCH_POSITION_OWN_BOX", "Offensive Touches – Own Box"),
+    ("OFFENSIVE_TOUCHES_IN_PITCH_POSITION_FIRST_THIRD", "Offensive Touches – First Third"),
+    ("OFFENSIVE_TOUCHES_IN_PITCH_POSITION_MIDDLE_THIRD", "Offensive Touches – Middle Third"),
+    ("OFFENSIVE_TOUCHES_IN_PITCH_POSITION_FINAL_THIRD", "Offensive Touches – Final Third"),
+    ("OFFENSIVE_TOUCHES_IN_PITCH_POSITION_OPPONENT_BOX", "Offensive Touches – Opponent Box"),
+    ("REVERSE_PLAY_NUMBER_FROM_PITCH_POSITION_FIRST_THIRD", "Reverse Plays – First Third"),
+    ("REVERSE_PLAY_NUMBER_FROM_PITCH_POSITION_MIDDLE_THIRD", "Reverse Plays – Middle Third"),
+    ("REVERSE_PLAY_NUMBER_FROM_PITCH_POSITION_FINAL_THIRD", "Reverse Plays – Final Third"),
+    ("REVERSE_PLAY_NUMBER_FROM_PITCH_POSITION_OPPONENT_BOX", "Reverse Plays – Opponent Box"),
+    ("REVERSE_PLAY_NUMBER_AT_PHASE_IN_POSSESSION", "Reverse Plays – In Possession"),
+    ("REVERSE_PLAY_NUMBER_AT_PHASE_ATTACKING_TRANSITION", "Reverse Plays – Attacking Transition"),
+    ("REVERSE_PLAY_NUMBER_AT_PHASE_SET_PIECE", "Reverse Plays – Set Piece"),
+    ("REVERSE_PLAY_NUMBER_AT_PHASE_SECOND_BALL", "Reverse Plays – Second Ball"),
+    ("WON_GROUND_DUELS_IN_PITCH_POSITION_OWN_BOX", "Won Ground Duels – Own Box"),
+    ("WON_GROUND_DUELS_IN_PITCH_POSITION_FIRST_THIRD", "Won Ground Duels – First Third"),
+    ("WON_GROUND_DUELS_IN_PITCH_POSITION_MIDDLE_THIRD", "Won Ground Duels – Middle Third"),
+    ("WON_GROUND_DUELS_IN_PITCH_POSITION_FINAL_THIRD", "Won Ground Duels – Final Third"),
+    ("WON_GROUND_DUELS_IN_PITCH_POSITION_OPPONENT_BOX", "Won Ground Duels – Opponent Box"),
+    ("PXT_PASS", "pxT – Pass"),
+    ("PXT_DRIBBLE", "pxT – Dribble"),
+    ("PXT_SETPIECE", "pxT – Set Piece"),
+    ("PXT_BLOCK", "pxT – Block"),
+    ("PXT_SHOT", "pxT – Shot"),
+    ("PXT_BALL_WIN", "pxT – Ball Win"),
+    ("PXT_FOUL", "pxT – Foul"),
+    ("PXT_NO_VIDEO", "pxT – No Video"),
+    ("PXT_REC", "pxT – Receiving"),
+    ("NUMBER_OF_PRESSES", "Number of Presses"),
+    ("NUMBER_OF_PRESSES_BUILD_UP", "Presses – Build-up"),
+    ("NUMBER_OF_PRESSES_BETWEEN_THE_LINES", "Presses – Between the Lines"),
+    ("NUMBER_OF_PRESSES_COUNTER_PRESS", "Presses – Counter Press"),
+)
+
+
+def most_common_value(values: pd.Series, default: str = "Unknown") -> str:
+    """Return the mode of ``values`` with graceful fallbacks."""
+
+    if values.empty:
+        return default
+
+    filtered = values.dropna()
+    if filtered.empty:
+        return default
+
+    modes = filtered.mode()
+    if not modes.empty:
+        return str(modes.iloc[0])
+
+    return str(filtered.iloc[0])
+
+
+def select_top_numeric_columns(
+    dataframe: pd.DataFrame,
+    exclude: Sequence[str],
+    limit: int,
+) -> List[str]:
+    """Return the most relevant numeric columns for display."""
+
+    numeric_columns = [
+        column
+        for column in dataframe.columns
+        if column not in exclude and is_numeric_dtype(dataframe[column])
+    ]
+    numeric_columns = sorted(
+        numeric_columns,
+        key=lambda column: dataframe[column].sum(skipna=True),
+        reverse=True,
+    )
+    return numeric_columns[:limit]
+
+
+def prepare_table(
+    dataframe: Optional[pd.DataFrame],
+    base_columns: Sequence[str],
+    extra_candidates: Optional[Sequence[str]] = None,
+    numeric_limit: int = 3,
+    top_n: int = 10,
+    sort_by: Optional[str] = None,
+) -> pd.DataFrame:
+    """Return a compact table with the selected columns formatted for display."""
+
+    if dataframe is None or dataframe.empty:
+        return pd.DataFrame()
+
+    df = dataframe.copy()
+    selected: List[str] = [column for column in base_columns if column in df.columns]
+
+    if extra_candidates:
+        for column in extra_candidates:
+            if column in df.columns and column not in selected:
+                selected.append(column)
+
+    exclude = set(selected)
+    numeric_columns = select_top_numeric_columns(df, exclude=selected, limit=numeric_limit)
+    selected.extend([column for column in numeric_columns if column not in selected])
+
+    if not selected:
+        return pd.DataFrame()
+
+    for column in selected:
+        if column in df.columns and is_datetime64_any_dtype(df[column]):
+            df[column] = pd.to_datetime(df[column]).dt.strftime("%Y-%m-%d")
+
+    table = df[selected]
+
+    sort_candidates = [column for column in [sort_by, *numeric_columns, *selected] if column in table.columns]
+    sort_column = sort_candidates[0]
+    table = table.sort_values(sort_column, ascending=False, na_position="last").head(top_n)
+    table = table.reset_index(drop=True)
+
+    numeric_subset = [column for column in table.columns if is_numeric_dtype(table[column])]
+    if numeric_subset:
+        table[numeric_subset] = table[numeric_subset].applymap(
+            lambda value: round(float(value), 2) if pd.notna(value) else np.nan
+        )
+
+    return table
+
+
+def summarise_player_scores(player_scores: Optional[pd.DataFrame], match_id: int) -> pd.DataFrame:
+    """Return a compact table containing the most relevant player scores for the match."""
+
+    if player_scores is None or player_scores.empty:
+        return pd.DataFrame()
+
+    filtered = player_scores[player_scores.get("matchId") == match_id]
+    if filtered.empty:
+        return pd.DataFrame()
+
+    filtered = filtered.copy()
+    return prepare_table(
+        filtered,
+        base_columns=["playerName", "squadName"],
+        extra_candidates=["position", "positions", "matchShare", "playDuration"],
+        numeric_limit=4,
+    )
+
+
+def summarise_player_profile_scores(
+    profile_scores: Optional[pd.DataFrame],
+    squad_ids: Sequence[int],
+) -> pd.DataFrame:
+    """Return player profile scores for the participating squads."""
+
+    if profile_scores is None or profile_scores.empty or not squad_ids:
+        return pd.DataFrame()
+
+    filtered = profile_scores[profile_scores.get("squadId").isin(squad_ids)]
+    if filtered.empty:
+        return pd.DataFrame()
+
+    filtered = filtered.copy()
+    return prepare_table(
+        filtered,
+        base_columns=["playerName", "squadName"],
+        extra_candidates=["positions", "matchShare", "playDuration"],
+        numeric_limit=4,
+    )
+
+
+def summarise_squad_scores(squad_scores: Optional[pd.DataFrame], match_id: int) -> pd.DataFrame:
+    """Return aggregated squad scores for the selected match."""
+
+    if squad_scores is None or squad_scores.empty:
+        return pd.DataFrame()
+
+    filtered = squad_scores[squad_scores.get("matchId") == match_id]
+    if filtered.empty:
+        return pd.DataFrame()
+
+    filtered = filtered.copy()
+    return prepare_table(
+        filtered,
+        base_columns=["squadName"],
+        extra_candidates=["matchShare", "playDuration"],
+        numeric_limit=4,
+        top_n=4,
+    )
+
+
+def parse_match_date(match_meta: Dict[str, object]) -> Optional[pd.Timestamp]:
+    """Return the scheduled match date if available."""
+
+    for key in ("scheduledDate", "dateTime"):
+        if key in match_meta and match_meta[key]:
+            try:
+                return pd.to_datetime(match_meta[key])
+            except Exception:  # pragma: no cover - defensive conversion
+                continue
+    return None
+
+
+def summarise_squad_ratings(
+    squad_ratings: Optional[pd.DataFrame],
+    squad_ids: Sequence[int],
+    match_date: Optional[pd.Timestamp],
+) -> pd.DataFrame:
+    """Return the latest squad ratings for the teams involved in the match."""
+
+    if squad_ratings is None or squad_ratings.empty or not squad_ids:
+        return pd.DataFrame()
+
+    filtered = squad_ratings[squad_ratings.get("squadId").isin(squad_ids)]
+    if filtered.empty:
+        return pd.DataFrame()
+
+    filtered = filtered.copy()
+    if "date" in filtered.columns and match_date is not None:
+        filtered["date_ts"] = pd.to_datetime(filtered["date"], errors="coerce")
+        filtered = filtered[filtered["date_ts"].notna()]
+        filtered = filtered[filtered["date_ts"] <= match_date]
+        filtered = filtered.sort_values("date_ts", ascending=False).drop_duplicates("squadId")
+
+    return prepare_table(
+        filtered,
+        base_columns=["squadName", "date" if "date" in filtered.columns else "iterationId"],
+        extra_candidates=["value"],
+        numeric_limit=1,
+        top_n=4,
+    )
+
+
+def summarise_squad_coefficients(
+    squad_coefficients: Optional[pd.DataFrame],
+    squad_ids: Sequence[int],
+    match_date: Optional[pd.Timestamp],
+) -> pd.DataFrame:
+    """Return the predictive coefficients for the squads involved."""
+
+    if squad_coefficients is None or squad_coefficients.empty or not squad_ids:
+        return pd.DataFrame()
+
+    filtered = squad_coefficients[squad_coefficients.get("squadId").isin(squad_ids)]
+    if filtered.empty:
+        return pd.DataFrame()
+
+    filtered = filtered.copy()
+    if "date" in filtered.columns and match_date is not None:
+        filtered["date_ts"] = pd.to_datetime(filtered["date"], errors="coerce")
+        filtered = filtered[filtered["date_ts"].notna()]
+        filtered = filtered[filtered["date_ts"] <= match_date]
+        filtered = filtered.sort_values("date_ts", ascending=False).drop_duplicates("squadId")
+
+    return prepare_table(
+        filtered,
+        base_columns=["squadName", "date" if "date" in filtered.columns else "iterationId"],
+        extra_candidates=[
+            "attackCoefficient",
+            "defenseCoefficient",
+            "homeCoefficient",
+            "competitionCoefficient",
+        ],
+        numeric_limit=4,
+        top_n=4,
+    )
+
+
+def summarise_set_pieces(set_pieces: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Return a simple breakdown of the most common set piece categories."""
+
+    if set_pieces is None or set_pieces.empty:
+        return pd.DataFrame()
+
+    category_column = next(
+        (
+            column
+            for column in [
+                "setPieceType",
+                "setPieceCategory",
+                "setPieceName",
+                "setPieceSubPhaseType",
+            ]
+            if column in set_pieces.columns
+        ),
+        None,
+    )
+
+    if category_column is None:
+        return pd.DataFrame()
+
+    summary = (
+        set_pieces.groupby(category_column).size().reset_index(name="Anzahl")
+        .sort_values("Anzahl", ascending=False)
+        .head(10)
+    )
+
+    if "setPieceResult" in set_pieces.columns:
+        goals = (
+            set_pieces[set_pieces["setPieceResult"].astype(str).str.contains("GOAL", case=False, na=False)]
+            .groupby(category_column)
+            .size()
+        )
+        summary["Tore"] = summary[category_column].map(goals).fillna(0).astype(int)
+
+    return summary
+
+
+def safe_api_call(description: str, func, *args, **kwargs):
+    """Execute ``func`` and capture exceptions with a concise console message."""
+
+    try:
+        print(f"📦 Lade {description}...")
+        result = func(*args, **kwargs)
+        if isinstance(result, pd.DataFrame):
+            print(f"✅ {description} geladen ({len(result)} Zeilen)")
+        else:
+            print(f"✅ {description} geladen")
+        return result
+    except Exception as error:  # pragma: no cover - defensive logging
+        print(f"⚠️ {description} konnte nicht geladen werden: {error}")
+        return None
+
+
+def load_additional_match_data(
+    match_id: int,
+    iteration_id: int,
+    token: str,
+    events: pd.DataFrame,
+) -> Dict[str, Optional[pd.DataFrame]]:
+    """Fetch optional match level datasets used for the extended dashboard."""
+
+    additional: Dict[str, Optional[pd.DataFrame]] = {}
+
+    additional["player_scores"] = safe_api_call(
+        "Player Match Scores",
+        ip.getPlayerMatchScores,
+        matches=[match_id],
+        token=token,
+    )
+
+    unique_positions: List[str] = []
+    position_series = events.get("position")
+    if position_series is not None:
+        unique_positions = sorted(
+            {
+                str(position).upper()
+                for position in position_series.dropna().unique()
+                if isinstance(position, str)
+            }
+        )
+    positions = [position for position in unique_positions if position in DEFAULT_PROFILE_POSITIONS]
+    if not positions:
+        positions = DEFAULT_PROFILE_POSITIONS
+
+    additional["player_profile_scores"] = safe_api_call(
+        "Player Profile Scores",
+        ip.getPlayerProfileScores,
+        iteration=iteration_id,
+        positions=positions,
+        token=token,
+    )
+
+    additional["squad_scores"] = safe_api_call(
+        "Squad Match Scores",
+        ip.getSquadMatchScores,
+        matches=[match_id],
+        token=token,
+    )
+
+    additional["set_pieces"] = safe_api_call(
+        "Set Pieces",
+        ip.getSetPieces,
+        matches=[match_id],
+        token=token,
+    )
+
+    additional["squad_ratings"] = safe_api_call(
+        "Squad Ratings",
+        ip.getSquadRatings,
+        iteration=iteration_id,
+        token=token,
+    )
+
+    additional["squad_coefficients"] = safe_api_call(
+        "Squad Coefficients",
+        ip.getSquadCoefficients,
+        iteration=iteration_id,
+        token=token,
+    )
+
+    return additional
+
+
 # ---------------------------------------------------------------------------
 # Aggregations
 # ---------------------------------------------------------------------------
@@ -333,6 +783,8 @@ def compute_team_kpis(events: pd.DataFrame) -> pd.DataFrame:
 
         shot_xg = subset.get("SHOT_XG", pd.Series(dtype=float)).sum()
         packing_xg = subset.get("PACKING_XG", pd.Series(dtype=float)).sum()
+        row["Shot-based xG"] = shot_xg
+        row["Packing xG"] = packing_xg
         row["xGoals (Shot+Packing)"] = shot_xg + packing_xg
 
         pxt_columns = [
@@ -347,25 +799,21 @@ def compute_team_kpis(events: pd.DataFrame) -> pd.DataFrame:
             ]
             if column in subset
         ]
-        row["Goal Threat gesamt (pxT)"] = subset[pxt_columns].sum(axis=1).sum() if pxt_columns else np.nan
-
-        def add_if(column: str, label: str) -> None:
-            row[label] = subset[column].sum() if column in subset else np.nan
-
-        add_if("SHOT_AT_GOAL_NUMBER", "Torschüsse")
-        add_if("CRITICAL_BALL_LOSS_NUMBER", "Kritische Ballverluste")
-        add_if("WON_GROUND_DUELS", "Gew. Boden-Duelle")
-        add_if("WON_AERIAL_DUELS", "Gew. Kopfball-Duelle")
-        add_if("EXPECTED_PASSES", "Expected Passes")
-        add_if("BYPASSED_OPPONENTS_TO_PITCH_POSITION_FINAL_THIRD", "Bypassed Opponents (Final 3rd)")
-        add_if(
-            "BYPASSED_DEFENDERS_BY_ACTION_LOW_PASS",
-            "Bypassed Defenders (Low Pass)",
+        row["Goal Threat gesamt (pxT)"] = (
+            subset[pxt_columns].sum(axis=1).sum() if pxt_columns else np.nan
         )
-        add_if(
-            "OFFENSIVE_TOUCHES_IN_PITCH_POSITION_FINAL_THIRD",
-            "Offensive Kontakte im letzten Drittel",
-        )
+
+        for column, label in TEAM_KPI_LABELS:
+            if column == "GOALS":
+                continue
+            if column in subset:
+                row[label] = subset[column].sum()
+
+        if "OFFENSIVE_TOUCHES_IN_PITCH_POSITION_FINAL_THIRD" in subset:
+            row.setdefault(
+                "Offensive Touches – Final Third",
+                subset["OFFENSIVE_TOUCHES_IN_PITCH_POSITION_FINAL_THIRD"].sum(),
+            )
 
         rows.append(row)
 
@@ -373,17 +821,19 @@ def compute_team_kpis(events: pd.DataFrame) -> pd.DataFrame:
     column_order = [
         "Team",
         "Goals",
+        "Shot-based xG",
+        "Packing xG",
+        "Post-shot xG",
         "xGoals (Shot+Packing)",
-        "Torschüsse",
-        "Kritische Ballverluste",
+        "Total Shots",
+        "Critical Ball Losses",
         "Goal Threat gesamt (pxT)",
-        "Gew. Boden-Duelle",
-        "Gew. Kopfball-Duelle",
-        "Expected Passes",
-        "Bypassed Opponents (Final 3rd)",
-        "Bypassed Defenders (Low Pass)",
-        "Offensive Kontakte im letzten Drittel",
     ]
+    column_order.extend([
+        label
+        for _column, label in TEAM_KPI_LABELS
+        if label not in column_order and label in team_kpis.columns
+    ])
     return team_kpis[[column for column in column_order if column in team_kpis.columns]]
 
 
@@ -449,6 +899,20 @@ def compute_player_ratings(
     if not required_columns.issubset(events.columns):
         missing = ", ".join(sorted(required_columns - set(events.columns)))
         raise ValueError(f"Spalten fehlen für die Spieleraggregation: {missing}")
+
+    canonical_positions = (
+        events.groupby(["playerId", "playerName", "squadId", "squadName"])["position"]
+        .agg(lambda values: most_common_value(values))
+        .reset_index()
+        .rename(columns={"position": "position_canonical"})
+    )
+    events = events.merge(
+        canonical_positions,
+        on=["playerId", "playerName", "squadId", "squadName"],
+        how="left",
+    )
+    events["position"] = events["position_canonical"].fillna(events["position"]).fillna("Unknown")
+    events = events.drop(columns="position_canonical")
 
     aggregations = {column: "sum" for column in [
         "SHOT_XG",
@@ -554,6 +1018,12 @@ def build_match_figure(
     phase_xg: pd.DataFrame,
     timeline: pd.DataFrame,
     players: pd.DataFrame,
+    player_scores: Optional[pd.DataFrame] = None,
+    player_profile_scores: Optional[pd.DataFrame] = None,
+    squad_scores: Optional[pd.DataFrame] = None,
+    squad_ratings: Optional[pd.DataFrame] = None,
+    squad_coefficients: Optional[pd.DataFrame] = None,
+    set_pieces: Optional[pd.DataFrame] = None,
 ) -> go.Figure:
     """Create the final Plotly figure containing all components."""
 
@@ -564,18 +1034,105 @@ def build_match_figure(
 
     colors = get_team_colors(home, away)
 
-    figure = make_subplots(
-        rows=4,
-        cols=1,
-        vertical_spacing=0.08,
-        row_heights=[0.25, 0.2, 0.3, 0.25],
-        specs=[[{"type": "bar"}], [{"type": "bar"}], [{"type": "scatter"}], [{"type": "table"}]],
-        subplot_titles=(
-            "Teamvergleich",
-            "xG nach Spielphasen (Aufbau / Konter / Pressing / Standard / Sonstige)",
-            "xG-Verlauf",
-            "Top-Spielerratings",
+    match_id = int(match_meta.get("id", -1))
+    home_squad_id = match_meta.get("homeSquadId")
+    away_squad_id = match_meta.get("awaySquadId")
+    squad_ids = [
+        squad_id
+        for squad_id in [home_squad_id, away_squad_id]
+        if squad_id is not None and not pd.isna(squad_id)
+    ]
+    match_date = parse_match_date(match_meta)
+
+    players_table = players.copy().rename(
+        columns={
+            "playerName": "Playername",
+            "squadName": "Squadname",
+            "position": "Position",
+            "pos_group": "Pos Group",
+            "minutes": "Minutes",
+            "xg": "xG",
+            "xa": "xA",
+            "off_threat": "Off Threat",
+            "won_duels": "Won Duels",
+            "lost_duels": "Lost Duels",
+            "presses": "Presses",
+            "neg_actions": "Neg Actions",
+            "off_score": "Off Rating",
+            "def_score": "Def Rating",
+            "rating": "Rating",
+        }
+    )
+
+    table_columns = [
+        "Playername",
+        "Squadname",
+        "Position",
+        "Pos Group",
+        "Minutes",
+        "xG",
+        "xA",
+        "Off Threat",
+        "Won Duels",
+        "Lost Duels",
+        "Presses",
+        "Neg Actions",
+        "Off Rating",
+        "Def Rating",
+        "Rating",
+    ]
+    table_columns = [column for column in table_columns if column in players_table.columns]
+    players_table = players_table[table_columns].head(15)
+
+    additional_tables: List[Tuple[str, pd.DataFrame]] = [
+        ("Top-Spielerratings", players_table),
+        (
+            "Player Match Scores",
+            summarise_player_scores(player_scores, match_id),
         ),
+        (
+            "Player Profile Scores",
+            summarise_player_profile_scores(player_profile_scores, squad_ids),
+        ),
+        (
+            "Squad Match Scores",
+            summarise_squad_scores(squad_scores, match_id),
+        ),
+        (
+            "Squad Ratings",
+            summarise_squad_ratings(squad_ratings, squad_ids, match_date),
+        ),
+        (
+            "Squad Coefficients",
+            summarise_squad_coefficients(squad_coefficients, squad_ids, match_date),
+        ),
+        (
+            "Set Piece Übersicht",
+            summarise_set_pieces(set_pieces),
+        ),
+    ]
+
+    table_sections = [(title, table) for title, table in additional_tables if table is not None and not table.empty]
+
+    num_tables = len(table_sections)
+    total_rows = 3 + num_tables
+
+    row_heights = [0.24, 0.2, 0.28] + [0.18] * num_tables
+    subplot_titles = [
+        "Teamvergleich",
+        "xG nach Spielphasen (Aufbau / Konter / Pressing / Standard / Sonstige)",
+        "xG-Verlauf",
+    ] + [title for title, _ in table_sections]
+
+    specs = [[{"type": "bar"}], [{"type": "bar"}], [{"type": "scatter"}]] + [[{"type": "table"}] for _ in table_sections]
+
+    figure = make_subplots(
+        rows=total_rows,
+        cols=1,
+        vertical_spacing=0.07,
+        row_heights=row_heights,
+        specs=specs,
+        subplot_titles=tuple(subplot_titles),
     )
 
     team_kpis = team_kpis.copy()
@@ -633,68 +1190,33 @@ def build_match_figure(
     figure.update_xaxes(title_text="Minute", row=3, col=1)
     figure.update_yaxes(title_text="xGoals", row=3, col=1)
 
-    players = players.copy().rename(
-        columns={
-            "playerName": "Playername",
-            "squadName": "Squadname",
-            "position": "Position",
-            "pos_group": "Pos Group",
-            "minutes": "Minutes",
-            "xg": "xG",
-            "xa": "xA",
-            "off_threat": "Off Threat",
-            "won_duels": "Won Duels",
-            "lost_duels": "Lost Duels",
-            "presses": "Presses",
-            "neg_actions": "Neg Actions",
-            "off_score": "Off Rating",
-            "def_score": "Def Rating",
-            "rating": "Rating",
-        }
-    )
-
-    table_columns = [
-        "Playername",
-        "Squadname",
-        "Position",
-        "Pos Group",
-        "Minutes",
-        "xG",
-        "xA",
-        "Off Threat",
-        "Won Duels",
-        "Lost Duels",
-        "Presses",
-        "Neg Actions",
-        "Off Rating",
-        "Def Rating",
-        "Rating",
-    ]
-    table_columns = [column for column in table_columns if column in players.columns]
-    players = players[table_columns].head(15)
-
-    figure.add_trace(
-        go.Table(
-            header=dict(
-                values=list(players.columns),
-                fill_color="#222222",
-                font=dict(color="white", size=11),
-                align="left",
-            ),
-            cells=dict(
-                values=[players[column].tolist() for column in players.columns],
-                fill_color="#F5F5F5",
-                align="left",
-            ),
-        ),
-        row=4,
-        col=1,
-    )
+    for index, (section_title, table) in enumerate(table_sections):
+        table = table.copy()
+        row_index = 4 + index
+        if not table.empty:
+            table = table.where(pd.notna(table), None)
+            figure.add_trace(
+                go.Table(
+                    header=dict(
+                        values=list(table.columns),
+                        fill_color="#222222",
+                        font=dict(color="white", size=11),
+                        align="left",
+                    ),
+                    cells=dict(
+                        values=[table[column].tolist() for column in table.columns],
+                        fill_color="#F5F5F5",
+                        align="left",
+                    ),
+                ),
+                row=row_index,
+                col=1,
+            )
 
     figure.update_layout(
         title=title,
         barmode="group",
-        height=900,
+        height=850 + 220 * num_tables,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         template="plotly_white",
     )
@@ -743,8 +1265,28 @@ def main() -> None:
     player_ratings = compute_player_ratings(events, player_matchsums, iteration_players)
     print(player_ratings.head(20).to_string(index=False))
 
+    print("\n📦 Lade zusätzliche Kennzahlen (Scores & Ratings)...")
+    additional_data = load_additional_match_data(
+        match_id=match_id,
+        iteration_id=iteration_id,
+        token=token,
+        events=events,
+    )
+
     print("\n📈 Erzeuge Match-Übersichts-Grafik...")
-    figure = build_match_figure(match_meta, team_kpis, phase_xg, timeline, player_ratings)
+    figure = build_match_figure(
+        match_meta,
+        team_kpis,
+        phase_xg,
+        timeline,
+        player_ratings,
+        player_scores=additional_data.get("player_scores"),
+        player_profile_scores=additional_data.get("player_profile_scores"),
+        squad_scores=additional_data.get("squad_scores"),
+        squad_ratings=additional_data.get("squad_ratings"),
+        squad_coefficients=additional_data.get("squad_coefficients"),
+        set_pieces=additional_data.get("set_pieces"),
+    )
     figure.show()
 
 
