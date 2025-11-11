@@ -658,9 +658,29 @@ def summarise_set_pieces(set_pieces: Optional[pd.DataFrame]) -> pd.DataFrame:
     summary["Kategorie"] = summary["Kategorie"].str.replace("_", " ").str.title()
     summary["Anzahl"] = summary["Anzahl"].astype(int)
 
-    focus_mask = summary["Kategorie"].str.contains("Free|Freistoß|Corner|Ecke", case=False, na=False)
-    if focus_mask.any():
-        summary = summary[focus_mask]
+    def _map_category(label: str) -> str:
+        lower = label.lower()
+        if "corner" in lower or "ecke" in lower:
+            return "Ecken"
+        if "free" in lower or "freisto" in lower:
+            return "Freistöße"
+        return label
+
+    summary["Kategorie"] = summary["Kategorie"].apply(_map_category)
+    summary = summary[summary["Kategorie"].isin(["Ecken", "Freistöße"])].copy()
+
+    if summary.empty:
+        return summary
+
+    aggregations = {"Anzahl": ("Anzahl", "sum")}
+    if "xG" in summary.columns:
+        aggregations["xG"] = ("xG", "sum")
+    summary = summary.groupby(["Team", "Kategorie"], as_index=False).agg(**aggregations)
+
+    summary["Anzahl"] = summary["Anzahl"].astype(int)
+
+    if "xG" not in summary.columns:
+        summary["xG"] = 0.0
 
     if "xG" in summary.columns:
         summary["xG"] = summary["xG"].round(2)
@@ -940,6 +960,37 @@ def compute_team_kpis(events: pd.DataFrame) -> pd.DataFrame:
                 row["Offensive Touches – Final Third"]
             )
 
+        duel_counts: Dict[Tuple[Optional[str], str], float] = {}
+        if "duelResult" in subset.columns:
+            duel_subset = subset[subset["duelResult"].notna()].copy()
+            if not duel_subset.empty:
+                duel_subset["duelResult_upper"] = duel_subset["duelResult"].astype(str).str.upper()
+                type_column = next(
+                    (column for column in ["duelDuelType", "duelType"] if column in duel_subset.columns),
+                    None,
+                )
+                if type_column:
+                    duel_subset["duelType_upper"] = duel_subset[type_column].astype(str).str.upper()
+                else:
+                    duel_subset["duelType_upper"] = ""
+
+                result_counts = duel_subset.groupby("duelResult_upper").size()
+                for result, count in result_counts.items():
+                    duel_counts[(None, str(result))] = float(count)
+
+                if "duelType_upper" in duel_subset:
+                    type_counts = duel_subset.groupby(["duelType_upper", "duelResult_upper"]).size()
+                    for (duel_type, result), count in type_counts.items():
+                        duel_counts[(str(duel_type), str(result))] = float(count)
+
+        def duel_type_from_label(label: str) -> Optional[str]:
+            lowered = label.lower()
+            if "ground" in lowered:
+                return "GROUND"
+            if "aerial" in lowered:
+                return "AERIAL"
+            return None
+
         duel_pairs = [
             ("Won Ground Duels", "Lost Ground Duels"),
             ("Won Aerial Duels", "Lost Aerial Duels"),
@@ -948,6 +999,19 @@ def compute_team_kpis(events: pd.DataFrame) -> pd.DataFrame:
         for won_label, lost_label in duel_pairs:
             won = float(row.get(won_label, np.nan))
             lost = float(row.get(lost_label, np.nan))
+            duel_type_key = duel_type_from_label(won_label)
+            won_key = (duel_type_key, "WON") if duel_type_key else (None, "WON")
+            lost_key = (duel_type_key, "LOST") if duel_type_key else (None, "LOST")
+
+            if (np.isnan(won) or won == 0.0) and won_key in duel_counts:
+                won = duel_counts[won_key]
+                row[won_label] = won
+                absolute_metrics.setdefault(won_label, {})[squad_name] = float(won)
+            if (np.isnan(lost) or lost == 0.0) and lost_key in duel_counts:
+                lost = duel_counts[lost_key]
+                row[lost_label] = lost
+                absolute_metrics.setdefault(lost_label, {})[squad_name] = float(lost)
+
             total = 0.0
             if not np.isnan(won):
                 absolute_metrics.setdefault(won_label, {})[squad_name] = won
@@ -1178,17 +1242,18 @@ def compute_player_ratings(
     players["lost_duels"] = players.get("LOST_GROUND_DUELS", 0.0) + players.get("LOST_AERIAL_DUELS", 0.0)
     players["presses"] = players.get("NUMBER_OF_PRESSES", 0.0)
 
-    if players["lost_duels"].sum() == 0 and {"duelPlayerId", "duelResult"}.issubset(events.columns):
+    if {"duelPlayerId", "duelResult"}.issubset(events.columns):
         duel_events = events[(events["duelPlayerId"].notna()) & (events["duelResult"].notna())]
         if not duel_events.empty:
-            lost_duels = (
-                duel_events[duel_events["duelResult"].str.upper() == "LOST"]
-                .groupby("duelPlayerId")
-                .size()
-            )
+            duel_events = duel_events.copy()
+            duel_results = duel_events["duelResult"].astype(str).str.upper()
+
+            lost_duels = duel_events[duel_results.str.contains("LOST", na=False)].groupby("duelPlayerId").size()
             if not lost_duels.empty:
+                lost_duels.index = pd.to_numeric(lost_duels.index, errors="coerce")
+                lost_duels = lost_duels[~pd.isna(lost_duels.index)].rename("lost_duels_fallback")
                 players = players.merge(
-                    lost_duels.rename("lost_duels_fallback"),
+                    lost_duels,
                     left_on="playerId",
                     right_index=True,
                     how="left",
@@ -1197,6 +1262,21 @@ def compute_player_ratings(
                     players["lost_duels"] > 0, players["lost_duels_fallback"].fillna(0)
                 )
                 players = players.drop(columns=["lost_duels_fallback"])
+
+            won_duels = duel_events[duel_results.str.contains("WON", na=False)].groupby("duelPlayerId").size()
+            if not won_duels.empty:
+                won_duels.index = pd.to_numeric(won_duels.index, errors="coerce")
+                won_duels = won_duels[~pd.isna(won_duels.index)].rename("won_duels_fallback")
+                players = players.merge(
+                    won_duels,
+                    left_on="playerId",
+                    right_index=True,
+                    how="left",
+                )
+                players["won_duels"] = players["won_duels"].where(
+                    players["won_duels"] > 0, players["won_duels_fallback"].fillna(0)
+                )
+                players = players.drop(columns=["won_duels_fallback"])
 
     if players["presses"].sum() == 0 and "pressingPlayerId" in events.columns:
         press_events = events[events["pressingPlayerId"].notna()]
@@ -1365,33 +1445,33 @@ def build_match_figure(
         player_sections.append((f"Spielerratings – {team}", subset))
 
     set_piece_summary = summarise_set_pieces(set_pieces)
+    squad_ratings_table = summarise_squad_ratings(squad_ratings, squad_ids, match_date)
 
-    additional_tables: List[Tuple[str, pd.DataFrame]] = player_sections + [
-        (
-            "Player Match Scores",
-            summarise_player_scores(player_scores, match_id),
-        ),
-        (
-            "Player Profile Scores",
-            summarise_player_profile_scores(player_profile_scores, squad_ids),
-        ),
-        (
-            "Squad Match Scores",
-            summarise_squad_scores(squad_scores, match_id),
-        ),
-        (
-            "Squad Ratings",
-            summarise_squad_ratings(squad_ratings, squad_ids, match_date),
-        ),
-        (
-            "Squad Coefficients",
-            summarise_squad_coefficients(squad_coefficients, squad_ids, match_date),
-        ),
-        (
-            "Set Piece Übersicht",
-            set_piece_summary,
-        ),
-    ]
+    additional_tables: List[Tuple[str, pd.DataFrame]] = []
+    if set_piece_summary is not None and not set_piece_summary.empty:
+        additional_tables.append(("Set Piece Übersicht", set_piece_summary))
+
+    additional_tables.extend(player_sections)
+    additional_tables.extend(
+        [
+            (
+                "Player Match Scores",
+                summarise_player_scores(player_scores, match_id),
+            ),
+            (
+                "Player Profile Scores",
+                summarise_player_profile_scores(player_profile_scores, squad_ids),
+            ),
+            (
+                "Squad Match Scores",
+                summarise_squad_scores(squad_scores, match_id),
+            ),
+            (
+                "Squad Coefficients",
+                summarise_squad_coefficients(squad_coefficients, squad_ids, match_date),
+            ),
+        ]
+    )
 
     table_sections = [(title, table) for title, table in additional_tables if table is not None and not table.empty]
 
@@ -1465,6 +1545,20 @@ def build_match_figure(
         team_kpis = team_kpis.sort_values("sort_key").drop(columns="sort_key")
 
     metrics = [column for column in team_kpis.columns if column != "Team"]
+    metric_exclusions = {
+        "pxT – Pass",
+        "pxT – Dribble",
+        "pxT – Set Piece",
+        "pxT – Block",
+        "pxT – Shot",
+        "pxT – Ball Win",
+        "pxT – Foul",
+        "pxT – No Video",
+        "pxT – Receiving",
+        "Won Duels",
+        "Lost Duels",
+    }
+    metrics = [metric for metric in metrics if metric not in metric_exclusions]
     home_share_values: List[float] = []
     away_share_values: List[float] = []
     home_text: List[str] = []
@@ -1583,6 +1677,14 @@ def build_match_figure(
 
     figure.update_xaxes(range=[0, 1], tickformat=".0%", row=1, col=1)
     figure.update_yaxes(categoryorder="array", categoryarray=metrics[::-1], row=1, col=1)
+    figure.add_vline(
+        x=0.5,
+        row=1,
+        col=1,
+        line_dash="dash",
+        line_color="rgba(0, 0, 0, 0.35)",
+        line_width=1,
+    )
 
     if not phase_xg.empty:
         phases_order = ["Spielaufbau", "Konter", "Pressing / 2. Bälle", "Standard", "Sonstige"]
@@ -1811,6 +1913,14 @@ def build_match_figure(
 
             figure.update_xaxes(range=[0, 1], tickformat=".0%", row=set_piece_row, col=1)
             figure.update_yaxes(categoryorder="array", categoryarray=categories[::-1], row=set_piece_row, col=1)
+            figure.add_vline(
+                x=0.5,
+                row=set_piece_row,
+                col=1,
+                line_dash="dash",
+                line_color="rgba(0, 0, 0, 0.35)",
+                line_width=1,
+            )
 
     if not timeline.empty:
         for team, color in [(home, colors["home_main"]), (away, colors["away_main"])]:
@@ -1869,6 +1979,43 @@ def build_match_figure(
         template="plotly_white",
     )
 
+    squad_rating_lookup: Dict[str, Dict[str, object]] = {}
+    if squad_ratings_table is not None and not squad_ratings_table.empty:
+        for record in squad_ratings_table.to_dict("records"):
+            team_name = record.get("squadName") or record.get("Squadname") or record.get("Team")
+            if not team_name:
+                continue
+            squad_rating_lookup[str(team_name)] = record
+
+    def build_rating_annotation(team_name: str) -> Optional[str]:
+        if not squad_rating_lookup:
+            return None
+
+        record = squad_rating_lookup.get(team_name)
+        if record is None:
+            for key, value in squad_rating_lookup.items():
+                if key.lower() == team_name.lower():
+                    record = value
+                    break
+        if record is None:
+            return None
+
+        rating_value = record.get("value", record.get("Value"))
+        date_value = record.get("date", record.get("Date", record.get("iterationId")))
+
+        parts: List[str] = []
+        if rating_value is not None and not pd.isna(rating_value):
+            try:
+                parts.append(f"Rating: {float(rating_value):.2f}")
+            except Exception:
+                parts.append(f"Rating: {rating_value}")
+        if date_value:
+            parts.append(f"Stand {date_value}")
+
+        if not parts:
+            return f"<b>{team_name}</b>"
+        return f"<b>{team_name}</b><br>{' · '.join(parts)}"
+
     home_logo = extract_team_logo(match_meta, "home")
     away_logo = extract_team_logo(match_meta, "away")
     logo_size = 0.12
@@ -1890,6 +2037,31 @@ def build_match_figure(
                 layer="above",
             )
         )
+        annotation = build_rating_annotation(home)
+        if annotation:
+            figure.add_annotation(
+                xref="paper",
+                yref="paper",
+                x=0.02 + logo_size / 2,
+                y=logo_y - 0.02,
+                text=annotation,
+                showarrow=False,
+                font=dict(size=14, color="#2b2b2b"),
+                align="center",
+            )
+    else:
+        annotation = build_rating_annotation(home)
+        if annotation:
+            figure.add_annotation(
+                xref="paper",
+                yref="paper",
+                x=0.02 + logo_size / 2,
+                y=logo_y - 0.02,
+                text=annotation,
+                showarrow=False,
+                font=dict(size=14, color="#2b2b2b"),
+                align="center",
+            )
     if away_logo:
         figure.add_layout_image(
             dict(
@@ -1906,6 +2078,31 @@ def build_match_figure(
                 layer="above",
             )
         )
+        annotation = build_rating_annotation(away)
+        if annotation:
+            figure.add_annotation(
+                xref="paper",
+                yref="paper",
+                x=0.98 - logo_size / 2,
+                y=logo_y - 0.02,
+                text=annotation,
+                showarrow=False,
+                font=dict(size=14, color="#2b2b2b"),
+                align="center",
+            )
+    else:
+        annotation = build_rating_annotation(away)
+        if annotation:
+            figure.add_annotation(
+                xref="paper",
+                yref="paper",
+                x=0.98 - logo_size / 2,
+                y=logo_y - 0.02,
+                text=annotation,
+                showarrow=False,
+                font=dict(size=14, color="#2b2b2b"),
+                align="center",
+            )
     return figure
 
 
