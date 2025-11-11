@@ -4,8 +4,8 @@ import pandas as pd
 import requests
 import re
 from impectPy.helpers import RateLimitedAPI, ForbiddenError
-from .matches import getMatchesFromHost
-from .iterations import getIterationsFromHost
+from impectPy.matches import getMatchesFromHost
+from impectPy.iterations import getIterationsFromHost
 
 ######
 #
