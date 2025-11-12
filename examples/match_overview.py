@@ -313,11 +313,7 @@ DUEL_RATIO_METRICS: Dict[str, Tuple[str, str]] = {
 
 TABLE_DESCRIPTIONS: Dict[str, str] = {
     "Spielerratings": "Individuelle Match-Leistung inkl. Offensiv-/Defensiv-Rating und Kernactions.",
-    "Player Match Scores": "Modelbasierte Match-Scores (pxT, Packing usw.) für jeden Spieler.",
-    "Player Profile Scores": "Profil-basierte Leistungswerte im Vergleich zur Positionsanforderung.",
-    "Squad Match Scores": "Teamweite Match-KPIs aus pxT-, Packing- und Pressing-Daten.",
     "Squad Ratings": "Letzter Rating-Stand der Teams vor dem Spiel (ELO/Power-Ranking).",
-    "Squad Coefficients": "Prädiktive Koeffizienten für Angriff, Defensive und Heimvorteil.",
     "Set Piece Übersicht": "Standard-Situationen nach xG-Anteil und Anzahl je Kategorie.",
 }
 
@@ -717,6 +713,11 @@ def summarise_set_pieces(set_pieces: Optional[pd.DataFrame]) -> pd.DataFrame:
         dataframe["xg_total"] = np.nan
 
     count_source = "setPieceId" if "setPieceId" in dataframe.columns else "category"
+    if count_source == "setPieceId":
+        dedupe_columns = ["setPieceId", "attackingSquadName", "category"]
+        available = [column for column in dedupe_columns if column in dataframe.columns]
+        if available:
+            dataframe = dataframe.sort_values(available).drop_duplicates(available, keep="last")
     summary = (
         dataframe.groupby(["attackingSquadName", "category"])
         .agg(
@@ -1333,13 +1334,18 @@ def compute_player_ratings(
 
     players["xg"] = players.get("SHOT_XG", 0.0)
     players["xa"] = players.get("EXPECTED_GOAL_ASSISTS", 0.0)
-    players["off_threat"] = (
-        players.get("PXT_PASS", 0.0)
-        + players.get("PXT_DRIBBLE", 0.0)
-        + players.get("PXT_SETPIECE", 0.0)
-        + players.get("PXT_SHOT", 0.0)
-        + players.get("PXT_BALL_WIN", 0.0)
-    )
+
+    pxt_components = [
+        players.get("PXT_PASS", 0.0),
+        players.get("PXT_DRIBBLE", 0.0),
+        players.get("PXT_SETPIECE", 0.0),
+        players.get("PXT_SHOT", 0.0),
+        players.get("PXT_BALL_WIN", 0.0),
+        players.get("PXT_BLOCK", 0.0),
+    ]
+    players["pxT"] = sum(pxt_components)
+    players["off_threat"] = players["pxT"]
+    players["packing"] = players.get("BYPASSED_OPPONENTS_DEFENDERS_RAW", 0.0)
     players["neg_actions"] = (
         players.get("LOST_GROUND_DUELS", 0.0)
         + players.get("LOST_AERIAL_DUELS", 0.0)
@@ -1471,6 +1477,8 @@ def compute_player_ratings(
         "minutes",
         "xg",
         "xa",
+        "pxT",
+        "packing",
         "off_threat",
         "won_duels",
         "lost_duels",
@@ -1530,7 +1538,8 @@ def build_match_figure(
             "minutes": "Minutes",
             "xg": "xG",
             "xa": "xA",
-            "off_threat": "Off Threat",
+            "pxT": "pxT",
+            "packing": "Packing",
             "won_duels": "Won Duels",
             "lost_duels": "Lost Duels",
             "presses": "Presses",
@@ -1549,7 +1558,8 @@ def build_match_figure(
         "Minutes",
         "xG",
         "xA",
-        "Off Threat",
+        "pxT",
+        "Packing",
         "Won Duels",
         "Lost Duels",
         "Presses",
@@ -1588,32 +1598,15 @@ def build_match_figure(
 
     set_piece_summary = summarise_set_pieces(set_pieces)
     squad_ratings_table = summarise_squad_ratings(squad_ratings, squad_ids, match_date)
+    squad_coefficients_summary = summarise_squad_coefficients(
+        squad_coefficients, squad_ids, match_date
+    )
 
     additional_tables: List[Tuple[str, pd.DataFrame]] = []
     if set_piece_summary is not None and not set_piece_summary.empty:
         additional_tables.append(("Set Piece Übersicht", set_piece_summary))
 
     additional_tables.extend(player_sections)
-    additional_tables.extend(
-        [
-            (
-                "Player Match Scores",
-                summarise_player_scores(player_scores, match_id),
-            ),
-            (
-                "Player Profile Scores",
-                summarise_player_profile_scores(player_profile_scores, squad_ids),
-            ),
-            (
-                "Squad Match Scores",
-                summarise_squad_scores(squad_scores, match_id),
-            ),
-            (
-                "Squad Coefficients",
-                summarise_squad_coefficients(squad_coefficients, squad_ids, match_date),
-            ),
-        ]
-    )
 
     raw_table_sections = [
         (title, table)
@@ -2252,6 +2245,19 @@ def build_match_figure(
             merged.setdefault("squadName", team_name)
             squad_rating_lookup[str(team_name)] = merged
 
+    if squad_coefficients_summary is not None and not squad_coefficients_summary.empty:
+        for record in squad_coefficients_summary.to_dict("records"):
+            team_name = record.get("squadName") or record.get("Squadname") or record.get("Team")
+            if not team_name:
+                continue
+            key = str(team_name)
+            existing = squad_rating_lookup.get(key, {"squadName": team_name})
+            for field in ["attackCoefficient", "defenseCoefficient", "homeCoefficient", "competitionCoefficient"]:
+                value = record.get(field) or record.get(field.title())
+                if value is not None and not pd.isna(value):
+                    existing[field] = value
+            squad_rating_lookup[key] = existing
+
     def build_rating_annotation(team_name: str) -> Optional[str]:
         if not squad_rating_lookup:
             return f"<b>{team_name}</b>"
@@ -2267,6 +2273,8 @@ def build_match_figure(
 
         rating_value = record.get("value", record.get("Value"))
         date_value = record.get("date", record.get("Date", record.get("iterationId")))
+        attack_value = record.get("attackCoefficient", record.get("AttackCoefficient"))
+        defense_value = record.get("defenseCoefficient", record.get("DefenseCoefficient"))
 
         parts: List[str] = []
         if rating_value is not None and not pd.isna(rating_value):
@@ -2274,6 +2282,24 @@ def build_match_figure(
                 parts.append(f"Rating: {float(rating_value):.2f}")
             except Exception:
                 parts.append(f"Rating: {rating_value}")
+
+        def _format_coefficient(label: str, value: object) -> Optional[str]:
+            if value is None or pd.isna(value):
+                return None
+            try:
+                numeric = float(value)
+            except Exception:
+                return f"{label}: {value}"
+            return f"{label}: {numeric:+.2f}"
+
+        formatted_attack = _format_coefficient("Angriff", attack_value)
+        if formatted_attack:
+            parts.append(formatted_attack)
+
+        formatted_defense = _format_coefficient("Defensive", defense_value)
+        if formatted_defense:
+            parts.append(formatted_defense)
+
         if date_value:
             parts.append(f"Stand {date_value}")
 
