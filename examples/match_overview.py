@@ -615,7 +615,7 @@ def extract_latest_squad_ratings(
                 if getattr(cutoff_value, "tzinfo", None) is not None:
                     cutoff_value = cutoff_value.tz_localize(None)
                 cutoff_subset = cutoff_subset[cutoff_subset["date_ts"] <= cutoff_value]
-            if cutoff_subset.empty():
+            if cutoff_subset.empty:
                 ordered = subset.sort_values("date_ts", ascending=False)
             else:
                 ordered = cutoff_subset.sort_values("date_ts", ascending=False)
@@ -927,7 +927,16 @@ def infer_minutes_from_matchsums(matchsums: List[Dict[str, float]]) -> pd.DataFr
                 df["minutes"] = 90.0
 
     df["minutes"] = df["minutes"].fillna(0.0)
-    return df[["playerId", "minutes"]]
+
+    if "playerId" not in df.columns:
+        return pd.DataFrame({"playerId": [], "minutes": []})
+
+    df = df[pd.notna(df["playerId"])]
+    grouped = (
+        df.groupby("playerId", as_index=False)["minutes"].sum()
+    )
+
+    return grouped[["playerId", "minutes"]]
 
 
 def group_position(position: str) -> str:
