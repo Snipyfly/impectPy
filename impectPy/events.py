@@ -3,7 +3,6 @@ import numpy as np
 import pandas as pd
 import requests
 import re
-import warnings
 from impectPy.helpers import RateLimitedAPI, ForbiddenError
 from impectPy.matches import getMatchesFromHost
 from impectPy.iterations import getIterationsFromHost
@@ -62,58 +61,21 @@ def getEventsFromHost(
         else:
             print(f"The following matches are not available yet and were ignored:\n{fail_matches}")
 
-    # restrict match data to available matches
-    match_data = match_data[match_data.id.isin(matches)]
+    # extract iterationIds
+    iterations = list(match_data[match_data.lastCalculationDate.notnull()].iterationId.unique())
 
     # get match events
-    failed_event_matches = []
-    event_frames = []
-
-    for match in matches:
-        try:
-            event_frames.append(
-                connection.make_api_request_limited(
-                    url=f"{host}/v5/customerapi/matches/{match}/events",
-                    method="GET"
-                ).process_response(
-                    endpoint="Events"
-                ).assign(
-                    matchId=match
-                )
-            )
-        except Exception as exc:
-            if "status code 500" in str(exc):
-                failed_event_matches.append((match, str(exc).replace("\n", " ")))
-                continue
-            raise
-
-    if failed_event_matches:
-        print("The following matches returned a server error when requesting events and were ignored:")
-        for match, error_message in failed_event_matches:
-            print(f"- matchId {match}: {error_message}")
-
-        failed_event_match_ids = {match for match, _ in failed_event_matches}
-        matches = [match for match in matches if match not in failed_event_match_ids]
-        match_data = match_data[match_data.id.isin(matches)]
-
-    if len(matches) == 0:
-        error_summary = "\n".join(
-            [f"matchId {match}: {error_message}" for match, error_message in failed_event_matches]
-        )
-        warnings.warn(
-            "Failed to retrieve events for all supplied matches due to server errors.\n"
-            + error_summary,
-            RuntimeWarning
-        )
-        return pd.DataFrame()
-
-    if not event_frames:
-        raise Exception("No events data could be retrieved for the supplied matches.")
-
-    events = pd.concat(event_frames, ignore_index=True)
-
-    # extract iterationIds
-    iteration_ids = list(match_data.iterationId.unique())
+    events = pd.concat(
+        map(lambda match: connection.make_api_request_limited(
+            url=f"{host}/v5/customerapi/matches/{match}/events",
+            method="GET"
+        ).process_response(
+            endpoint="Events"
+        ).assign(
+            matchId=match
+        ),
+            matches),
+        ignore_index=True)
 
     # account for matches without dribbles, duels or opponents tagged
     attributes = [
@@ -142,7 +104,7 @@ def getEventsFromHost(
         ).process_response(
             endpoint="Players"
         ),
-            iteration_ids),
+            iterations),
         ignore_index=True)[["id", "commonname"]].drop_duplicates()
 
     # get squads
@@ -153,7 +115,7 @@ def getEventsFromHost(
         ).process_response(
             endpoint="Squads"
         ),
-            iteration_ids),
+            iterations),
         ignore_index=True)[["id", "name"]].drop_duplicates()
 
     # get coaches
@@ -167,7 +129,7 @@ def getEventsFromHost(
                 endpoint="Coaches",
                 raise_exception=False
             ),
-                iteration_ids),
+                iterations),
             ignore_index=True)[["id", "name"]].drop_duplicates()
     except KeyError:
         # no coaches found, create empty df
@@ -182,7 +144,7 @@ def getEventsFromHost(
             connection=connection,
             host=host
         ),
-            iteration_ids),
+            iterations),
         ignore_index=True)
 
     # get iterations

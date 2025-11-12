@@ -11,44 +11,17 @@ from .iterations import getIterationsFromHost
 def _ensure_lost_duels_column(dataframe: pd.DataFrame) -> bool:
     """Add a ``Lost Duels`` column derived from available duel components."""
 
-    def _normalize(name: str) -> str:
-        return "".join(ch for ch in name.lower() if ch.isalnum())
-
-    normalized_lookup = defaultdict(list)
-    for column in dataframe.columns:
-        normalized_lookup[_normalize(column)].append(column)
-
     if "Lost Duels" in dataframe.columns:
         return True
 
-    existing_aliases = normalized_lookup.get("lostduels")
-    if existing_aliases:
-        alias_column = existing_aliases[0]
-        if alias_column != "Lost Duels":
-            dataframe["Lost Duels"] = pd.to_numeric(
-                dataframe[alias_column], errors="coerce"
-            )
-        return True
-
-    def _find_first_match(*candidates: str) -> Optional[str]:
-        for candidate in candidates:
-            for column in normalized_lookup.get(candidate, []):
-                return column
-        return None
-
-    lost_duels = pd.Series(index=dataframe.index, dtype="float64")
-
-    component_aliases = [
-        ("lostgroundduels", "groundduelslost", "lostgroundduel"),
-        ("lostaerialduels", "aerialduelslost", "lostaerialduel"),
-    ]
+    column_lookup = {column.lower(): column for column in dataframe.columns}
 
     lost_duels = pd.Series(index=dataframe.index, dtype="float64")
 
     component_candidates = [
-        match
-        for aliases in component_aliases
-        if (match := _find_first_match(*aliases)) is not None
+        column_lookup[key]
+        for key in ["lost ground duels", "lost aerial duels"]
+        if key in column_lookup
     ]
 
     if component_candidates:
@@ -58,8 +31,8 @@ def _ensure_lost_duels_column(dataframe: pd.DataFrame) -> bool:
         component_sum = components.sum(axis=1, min_count=1)
         lost_duels = component_sum
 
-    duel_column = _find_first_match("duels", "totalduels")
-    won_column = _find_first_match("wonduels", "duelswon")
+    duel_column = column_lookup.get("duels")
+    won_column = column_lookup.get("won duels")
 
     if duel_column is not None and won_column is not None:
         duels = pd.to_numeric(dataframe[duel_column], errors="coerce")
