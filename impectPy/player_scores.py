@@ -1,7 +1,5 @@
 # load packages
 import warnings
-from collections import defaultdict
-from typing import Optional
 
 import pandas as pd
 import requests
@@ -44,6 +42,8 @@ def _ensure_lost_duels_column(dataframe: pd.DataFrame) -> bool:
         ("lostgroundduels", "groundduelslost", "lostgroundduel"),
         ("lostaerialduels", "aerialduelslost", "lostaerialduel"),
     ]
+
+    lost_duels = pd.Series(index=dataframe.index, dtype="float64")
 
     component_candidates = [
         match
