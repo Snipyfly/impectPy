@@ -311,6 +311,9 @@ DUEL_RATIO_METRICS: Dict[str, Tuple[str, str]] = {
 }
 
 
+INVERTED_TEAM_METRICS = {"Critical Ball Losses"}
+
+
 TABLE_DESCRIPTIONS: Dict[str, str] = {
     "Spielerratings": "Individuelle Match-Leistung inkl. Offensiv-/Defensiv-Rating und Kernactions.",
     "Squad Ratings": "Letzter Rating-Stand der Teams vor dem Spiel (ELO/Power-Ranking).",
@@ -766,6 +769,57 @@ def summarise_set_pieces(set_pieces: Optional[pd.DataFrame]) -> pd.DataFrame:
         summary["xG"] = summary["xG"].round(2)
 
     return summary.sort_values(["Team", "Kategorie"]).reset_index(drop=True)
+
+
+def cap_set_piece_xg(summary: Optional[pd.DataFrame], phase_xg: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Limit set-piece xG totals to the phase based xG for standards."""
+
+    if summary is None:
+        return pd.DataFrame()
+
+    if not isinstance(summary, pd.DataFrame):
+        return summary
+
+    if summary.empty or "xG" not in summary.columns:
+        return summary
+
+    if phase_xg is None or not isinstance(phase_xg, pd.DataFrame) or phase_xg.empty:
+        return summary
+
+    required_columns = {"phase_group", "squadName", "xg_total"}
+    if not required_columns.issubset(phase_xg.columns):
+        return summary
+
+    standards = phase_xg[phase_xg["phase_group"] == "Standard"]
+    if standards.empty:
+        return summary
+
+    caps = standards.groupby("squadName")["xg_total"].sum()
+    if caps.empty:
+        return summary
+
+    capped = summary.copy()
+
+    for team, cap in caps.items():
+        team_mask = capped["Team"] == team
+        if not team_mask.any():
+            continue
+
+        if pd.isna(cap) or cap <= 0:
+            capped.loc[team_mask, "xG"] = 0.0
+            continue
+
+        team_total = capped.loc[team_mask, "xG"].sum()
+        if pd.isna(team_total) or team_total <= cap or team_total <= 0:
+            continue
+
+        scale = float(cap) / float(team_total)
+        capped.loc[team_mask, "xG"] *= scale
+
+    if "xG" in capped.columns:
+        capped["xG"] = capped["xG"].round(2)
+
+    return capped
 
 
 def safe_api_call(description: str, func, *args, **kwargs):
@@ -1611,6 +1665,7 @@ def build_match_figure(
         player_sections.append((f"Spielerratings – {team}", subset))
 
     set_piece_summary = summarise_set_pieces(set_pieces)
+    set_piece_summary = cap_set_piece_xg(set_piece_summary, phase_xg)
     squad_ratings_table = summarise_squad_ratings(squad_ratings, squad_ids, match_date)
     squad_coefficients_summary = summarise_squad_coefficients(
         squad_coefficients, squad_ids, match_date
@@ -1750,26 +1805,27 @@ def build_match_figure(
             away_won = abs_metrics.get(won_label, {}).get(away, np.nan)
             away_lost = abs_metrics.get(lost_label, {}).get(away, np.nan)
 
+            home_won = float(home_won) if pd.notna(home_won) else np.nan
+            home_lost = float(home_lost) if pd.notna(home_lost) else np.nan
+            away_won = float(away_won) if pd.notna(away_won) else np.nan
+            away_lost = float(away_lost) if pd.notna(away_lost) else np.nan
+
             home_total = sum(value for value in [home_won, home_lost] if not pd.isna(value))
             away_total = sum(value for value in [away_won, away_lost] if not pd.isna(value))
 
-            home_share = pd.to_numeric(team_kpis.iloc[0].get(metric, np.nan), errors="coerce")
-            if pd.isna(home_share):
-                home_share = pd.to_numeric(abs_metrics.get(metric, {}).get(home, np.nan), errors="coerce")
-            away_share = pd.to_numeric(team_kpis.iloc[1].get(metric, np.nan), errors="coerce")
-            if pd.isna(away_share):
-                away_share = pd.to_numeric(abs_metrics.get(metric, {}).get(away, np.nan), errors="coerce")
+            home_share = home_won / home_total if home_total > 0 else np.nan
+            away_share = away_won / away_total if away_total > 0 else np.nan
 
-            home_share = float(home_share) if not pd.isna(home_share) else 0.0
-            away_share = float(away_share) if not pd.isna(away_share) else 0.0
+            home_share_value = float(home_share) if not pd.isna(home_share) else 0.0
+            away_share_value = float(away_share) if not pd.isna(away_share) else 0.0
 
             home_hover.append(
                 "<b>{metric}</b><br>{team}: {won} von {total} Aktionen<br>Quote: {share}".format(
                     metric=metric,
                     team=home,
-                    won=format_absolute_value(home_won),
+                    won=format_absolute_value(0.0 if pd.isna(home_won) else home_won),
                     total=format_absolute_value(home_total),
-                    share=f"{home_share:.0%}",
+                    share=f"{home_share:.0%}" if home_total > 0 and not pd.isna(home_share) else "–",
                 )
                 if home_total > 0
                 else f"<b>{metric}</b><br>{home}: Keine Daten"
@@ -1778,18 +1834,18 @@ def build_match_figure(
                 "<b>{metric}</b><br>{team}: {won} von {total} Aktionen<br>Quote: {share}".format(
                     metric=metric,
                     team=away,
-                    won=format_absolute_value(away_won),
+                    won=format_absolute_value(0.0 if pd.isna(away_won) else away_won),
                     total=format_absolute_value(away_total),
-                    share=f"{away_share:.0%}",
+                    share=f"{away_share:.0%}" if away_total > 0 and not pd.isna(away_share) else "–",
                 )
                 if away_total > 0
                 else f"<b>{metric}</b><br>{away}: Keine Daten"
             )
 
-            home_share_values.append(home_share)
-            away_share_values.append(away_share)
-            home_text.append(f"{home_share:.0%}" if home_total > 0 else "")
-            away_text.append(f"{away_share:.0%}" if away_total > 0 else "")
+            home_share_values.append(home_share_value)
+            away_share_values.append(away_share_value)
+            home_text.append(f"{home_share:.0%}" if home_total > 0 and not pd.isna(home_share) else "")
+            away_text.append(f"{away_share:.0%}" if away_total > 0 and not pd.isna(away_share) else "")
             continue
 
         home_abs = abs_metrics.get(metric, {}).get(home, np.nan)
@@ -1837,28 +1893,50 @@ def build_match_figure(
             )
         else:
             total = home_value + away_value
-            home_share = home_value / total if total > 0 else 0.0
-            away_share = away_value / total if total > 0 else 0.0
+            invert_metric = metric in INVERTED_TEAM_METRICS
+            if total > 0:
+                if invert_metric:
+                    home_share = 1.0 - (home_value / total)
+                    away_share = 1.0 - (away_value / total)
+                else:
+                    home_share = home_value / total
+                    away_share = away_value / total
+            else:
+                home_share = 0.0
+                away_share = 0.0
+
+            if total > 0:
+                home_share = float(np.clip(home_share, 0.0, 1.0))
+                away_share = float(np.clip(away_share, 0.0, 1.0))
+            else:
+                home_share = 0.0
+                away_share = 0.0
+
             home_denominator = total
             away_denominator = total
+            share_label = "Anteil"
+            if invert_metric:
+                share_label = "Relativer Vorteil (weniger ist besser)"
             home_hover.append(
-                "<b>{metric}</b><br>{team}: {value}<br>Gesamt: {total_value}<br>Anteil: {share}".format(
+                "<b>{metric}</b><br>{team}: {value}<br>Gesamt: {total_value}<br>{label}: {share}".format(
                     metric=metric,
                     team=home,
                     value=format_absolute_value(home_abs),
                     total_value=format_absolute_value(home_denominator),
-                    share=f"{home_share:.0%}",
+                    label=share_label,
+                    share=f"{home_share:.0%}" if total > 0 else "–",
                 )
                 if total > 0
                 else f"<b>{metric}</b><br>{home}: Keine Daten"
             )
             away_hover.append(
-                "<b>{metric}</b><br>{team}: {value}<br>Gesamt: {total_value}<br>Anteil: {share}".format(
+                "<b>{metric}</b><br>{team}: {value}<br>Gesamt: {total_value}<br>{label}: {share}".format(
                     metric=metric,
                     team=away,
                     value=format_absolute_value(away_abs),
                     total_value=format_absolute_value(away_denominator),
-                    share=f"{away_share:.0%}",
+                    label=share_label,
+                    share=f"{away_share:.0%}" if total > 0 else "–",
                 )
                 if total > 0
                 else f"<b>{metric}</b><br>{away}: Keine Daten"
