@@ -305,6 +305,11 @@ DUEL_METRIC_COUNTERPARTS: Dict[str, str] = {
     "Lost Duels": "Won Duels",
 }
 
+DUEL_RATIO_METRICS: Dict[str, Tuple[str, str]] = {
+    "Zweikampfquote Boden": ("Won Ground Duels", "Lost Ground Duels"),
+    "Zweikampfquote Luft": ("Won Aerial Duels", "Lost Aerial Duels"),
+}
+
 
 TABLE_DESCRIPTIONS: Dict[str, str] = {
     "Spielerratings": "Individuelle Match-Leistung inkl. Offensiv-/Defensiv-Rating und Kernactions.",
@@ -563,6 +568,73 @@ def summarise_squad_ratings(
         top_n=4,
         dedupe_on=["squadId", "squadName"],
     )
+
+
+def extract_latest_squad_ratings(
+    squad_ratings: Optional[pd.DataFrame],
+    squad_ids: Sequence[int],
+    match_date: Optional[pd.Timestamp],
+) -> Dict[int, Dict[str, object]]:
+    """Return the most recent rating entry per squad id."""
+
+    if squad_ratings is None or squad_ratings.empty or not squad_ids:
+        return {}
+
+    filtered = squad_ratings[squad_ratings.get("squadId").isin(squad_ids)]
+    if filtered.empty:
+        return {}
+
+    filtered = filtered.copy()
+    date_column: Optional[str] = None
+    for candidate in ("date", "calculationDate", "calculatedAt"):
+        if candidate in filtered.columns:
+            date_column = candidate
+            break
+
+    if date_column:
+        filtered["date_ts"] = pd.to_datetime(filtered[date_column], errors="coerce", utc=True)
+        filtered = filtered[filtered["date_ts"].notna()]
+        if match_date is not None:
+            match_cutoff = match_date
+            if getattr(match_cutoff, "tzinfo", None) is not None:
+                match_cutoff = match_cutoff.tz_localize(None)
+            filtered["date_ts"] = filtered["date_ts"].dt.tz_localize(None)
+    else:
+        filtered["date_ts"] = pd.NaT
+
+    latest: Dict[int, Dict[str, object]] = {}
+    for squad_id in squad_ids:
+        subset = filtered[filtered.get("squadId") == squad_id]
+        if subset.empty:
+            continue
+
+        if date_column:
+            cutoff_subset = subset[subset["date_ts"].notna()]
+            if match_date is not None:
+                cutoff_value = match_date
+                if getattr(cutoff_value, "tzinfo", None) is not None:
+                    cutoff_value = cutoff_value.tz_localize(None)
+                cutoff_subset = cutoff_subset[cutoff_subset["date_ts"] <= cutoff_value]
+            if cutoff_subset.empty():
+                ordered = subset.sort_values("date_ts", ascending=False)
+            else:
+                ordered = cutoff_subset.sort_values("date_ts", ascending=False)
+        elif "iterationId" in subset.columns:
+            ordered = subset.sort_values("iterationId", ascending=False)
+        else:
+            ordered = subset.sort_index(ascending=False)
+
+        if ordered.empty():
+            continue
+
+        record = ordered.iloc[0]
+        latest[int(squad_id)] = {
+            "squadName": record.get("squadName") or record.get("Squadname") or record.get("Team"),
+            "value": record.get("value", record.get("Value")),
+            "date": record.get(date_column) if date_column else record.get("iterationId"),
+        }
+
+    return latest
 
 
 def summarise_squad_coefficients(
@@ -1047,6 +1119,26 @@ def compute_team_kpis(events: pd.DataFrame) -> pd.DataFrame:
 
     team_kpis = pd.DataFrame(rows)
     team_kpis.attrs["absolute_metrics"] = absolute_metrics
+
+    for ratio_label, (won_label, lost_label) in DUEL_RATIO_METRICS.items():
+        shares: List[float] = []
+        for team in team_kpis.get("Team", []):
+            won_abs = absolute_metrics.get(won_label, {}).get(team, np.nan)
+            lost_abs = absolute_metrics.get(lost_label, {}).get(team, np.nan)
+            total = 0.0
+            value = np.nan
+            if not pd.isna(won_abs):
+                total += float(won_abs)
+            if not pd.isna(lost_abs):
+                total += float(lost_abs)
+            if total > 0 and not pd.isna(won_abs):
+                value = float(won_abs) / total
+            shares.append(value)
+        if shares and any(pd.notna(share) for share in shares):
+            team_kpis[ratio_label] = shares
+            for team, share in zip(team_kpis.get("Team", []), shares):
+                if pd.notna(share):
+                    absolute_metrics.setdefault(ratio_label, {})[team] = float(share)
     column_order = [
         "Team",
         "Goals",
@@ -1063,6 +1155,9 @@ def compute_team_kpis(events: pd.DataFrame) -> pd.DataFrame:
         for _column, label in TEAM_KPI_LABELS
         if label not in column_order and label in team_kpis.columns
     ])
+    for ratio_label in DUEL_RATIO_METRICS:
+        if ratio_label not in column_order and ratio_label in team_kpis.columns:
+            column_order.append(ratio_label)
     return team_kpis[[column for column in column_order if column in team_kpis.columns]]
 
 
@@ -1248,10 +1343,42 @@ def compute_player_ratings(
             duel_events = duel_events.copy()
             duel_results = duel_events["duelResult"].astype(str).str.upper()
 
+            def normalise_counts(counts: pd.Series) -> pd.Series:
+                if counts.empty:
+                    return counts
+                normalized_index = pd.to_numeric(counts.index, errors="coerce")
+                counts.index = normalized_index
+                counts = counts[~pd.isna(counts.index)]
+                try:
+                    counts.index = counts.index.astype(int)
+                except Exception:
+                    counts.index = counts.index.astype("Int64")
+                return counts.astype(float)
+
             lost_duels = duel_events[duel_results.str.contains("LOST", na=False)].groupby("duelPlayerId").size()
+            possible_opponent_columns = [
+                column
+                for column in [
+                    "duelOpponentId",
+                    "duelOpponentPlayerId",
+                    "opponentPlayerId",
+                    "opponentId",
+                ]
+                if column in duel_events.columns
+            ]
+            if possible_opponent_columns:
+                winner_mask = duel_results.str.contains("WON", na=False)
+                for column in possible_opponent_columns:
+                    opponent_series = duel_events.loc[winner_mask, column]
+                    if opponent_series.empty:
+                        continue
+                    opponent_counts = opponent_series.value_counts()
+                    opponent_counts = normalise_counts(opponent_counts)
+                    if not opponent_counts.empty:
+                        lost_duels = lost_duels.add(opponent_counts, fill_value=0)
+
             if not lost_duels.empty:
-                lost_duels.index = pd.to_numeric(lost_duels.index, errors="coerce")
-                lost_duels = lost_duels[~pd.isna(lost_duels.index)].rename("lost_duels_fallback")
+                lost_duels = normalise_counts(lost_duels).rename("lost_duels_fallback")
                 players = players.merge(
                     lost_duels,
                     left_on="playerId",
@@ -1265,8 +1392,7 @@ def compute_player_ratings(
 
             won_duels = duel_events[duel_results.str.contains("WON", na=False)].groupby("duelPlayerId").size()
             if not won_duels.empty:
-                won_duels.index = pd.to_numeric(won_duels.index, errors="coerce")
-                won_duels = won_duels[~pd.isna(won_duels.index)].rename("won_duels_fallback")
+                won_duels = normalise_counts(won_duels).rename("won_duels_fallback")
                 players = players.merge(
                     won_duels,
                     left_on="playerId",
@@ -1473,17 +1599,37 @@ def build_match_figure(
         ]
     )
 
-    table_sections = [(title, table) for title, table in additional_tables if table is not None and not table.empty]
+    raw_table_sections = [
+        (title, table)
+        for title, table in additional_tables
+        if table is not None and not table.empty
+    ]
+
+    set_piece_table_section: Optional[Tuple[str, pd.DataFrame]] = None
+    table_sections: List[Tuple[str, pd.DataFrame]] = []
+    for title, table in raw_table_sections:
+        if title == "Set Piece Übersicht":
+            set_piece_table_section = (title, table)
+        else:
+            table_sections.append((title, table))
 
     num_tables = len(table_sections)
     has_set_piece_chart = set_piece_summary is not None and not set_piece_summary.empty
+    has_set_piece_table = set_piece_table_section is not None
 
-    base_rows = 3 + (1 if has_set_piece_chart else 0)
+    base_rows = 3 + (1 if has_set_piece_chart else 0) + (1 if has_set_piece_table else 0)
     total_rows = base_rows + num_tables
 
     base_row_heights: List[float] = [0.34, 0.3]
     if has_set_piece_chart:
-        base_row_heights.append(0.3)
+        base_row_heights.append(0.28)
+    if has_set_piece_table:
+        table_length = (
+            int(set_piece_table_section[1].shape[0])
+            if hasattr(set_piece_table_section[1], "shape")
+            else 0
+        )
+        base_row_heights.append(0.22 + 0.01 * min(table_length, 10))
     base_row_heights.append(0.32)
 
     table_row_heights: List[float] = []
@@ -1504,19 +1650,20 @@ def build_match_figure(
                 return f"{title_text}<br><sup>{description}</sup>"
         return title_text
 
-    subplot_titles = [
-        "Teamvergleich",
-        "xG nach Spielphasen (Aufbau / Konter / Pressing / Standard / Sonstige)",
+    base_titles: List[Tuple[str, str]] = [
+        ("Teamvergleich", "bar"),
+        ("xG nach Spielphasen (Aufbau / Konter / Pressing / Standard / Sonstige)", "bar"),
     ]
     if has_set_piece_chart:
-        subplot_titles.append("Set Piece xG-Anteile")
-    subplot_titles.append("xG-Verlauf")
+        base_titles.append(("Set Piece xG-Anteile", "bar"))
+    if has_set_piece_table:
+        base_titles.append((format_subplot_title("Set Piece Übersicht"), "table"))
+    base_titles.append(("xG-Verlauf", "scatter"))
+
+    subplot_titles = [title for title, _ in base_titles]
     subplot_titles.extend(format_subplot_title(title) for title, _ in table_sections)
 
-    chart_types: List[str] = ["bar", "bar"]
-    if has_set_piece_chart:
-        chart_types.append("bar")
-    chart_types.append("scatter")
+    chart_types: List[str] = [chart for _, chart in base_titles]
     chart_types.extend(["table"] * num_tables)
 
     if len(chart_types) != total_rows:
@@ -1555,6 +1702,10 @@ def build_match_figure(
         "pxT – Foul",
         "pxT – No Video",
         "pxT – Receiving",
+        "Won Ground Duels",
+        "Lost Ground Duels",
+        "Won Aerial Duels",
+        "Lost Aerial Duels",
         "Won Duels",
         "Lost Duels",
     }
@@ -1567,6 +1718,57 @@ def build_match_figure(
     away_hover: List[str] = []
 
     for metric in metrics:
+        ratio_details = DUEL_RATIO_METRICS.get(metric)
+        if ratio_details:
+            won_label, lost_label = ratio_details
+
+            home_won = abs_metrics.get(won_label, {}).get(home, np.nan)
+            home_lost = abs_metrics.get(lost_label, {}).get(home, np.nan)
+            away_won = abs_metrics.get(won_label, {}).get(away, np.nan)
+            away_lost = abs_metrics.get(lost_label, {}).get(away, np.nan)
+
+            home_total = sum(value for value in [home_won, home_lost] if not pd.isna(value))
+            away_total = sum(value for value in [away_won, away_lost] if not pd.isna(value))
+
+            home_share = pd.to_numeric(team_kpis.iloc[0].get(metric, np.nan), errors="coerce")
+            if pd.isna(home_share):
+                home_share = pd.to_numeric(abs_metrics.get(metric, {}).get(home, np.nan), errors="coerce")
+            away_share = pd.to_numeric(team_kpis.iloc[1].get(metric, np.nan), errors="coerce")
+            if pd.isna(away_share):
+                away_share = pd.to_numeric(abs_metrics.get(metric, {}).get(away, np.nan), errors="coerce")
+
+            home_share = float(home_share) if not pd.isna(home_share) else 0.0
+            away_share = float(away_share) if not pd.isna(away_share) else 0.0
+
+            home_hover.append(
+                "<b>{metric}</b><br>{team}: {won} von {total} Aktionen<br>Quote: {share}".format(
+                    metric=metric,
+                    team=home,
+                    won=format_absolute_value(home_won),
+                    total=format_absolute_value(home_total),
+                    share=f"{home_share:.0%}",
+                )
+                if home_total > 0
+                else f"<b>{metric}</b><br>{home}: Keine Daten"
+            )
+            away_hover.append(
+                "<b>{metric}</b><br>{team}: {won} von {total} Aktionen<br>Quote: {share}".format(
+                    metric=metric,
+                    team=away,
+                    won=format_absolute_value(away_won),
+                    total=format_absolute_value(away_total),
+                    share=f"{away_share:.0%}",
+                )
+                if away_total > 0
+                else f"<b>{metric}</b><br>{away}: Keine Daten"
+            )
+
+            home_share_values.append(home_share)
+            away_share_values.append(away_share)
+            home_text.append(f"{home_share:.0%}" if home_total > 0 else "")
+            away_text.append(f"{away_share:.0%}" if away_total > 0 else "")
+            continue
+
         home_abs = abs_metrics.get(metric, {}).get(home, np.nan)
         away_abs = abs_metrics.get(metric, {}).get(away, np.nan)
 
@@ -1784,8 +1986,18 @@ def build_match_figure(
             figure.update_xaxes(range=[0, 1], tickformat=".0%", row=2, col=1)
             figure.update_yaxes(categoryorder="array", categoryarray=phases[::-1], row=2, col=1)
 
-    set_piece_row = 3 if has_set_piece_chart else None
-    timeline_row = 3 + (1 if has_set_piece_chart else 0)
+    next_row_index = 3
+    set_piece_row = None
+    if has_set_piece_chart:
+        set_piece_row = next_row_index
+        next_row_index += 1
+
+    set_piece_table_row = None
+    if has_set_piece_table:
+        set_piece_table_row = next_row_index
+        next_row_index += 1
+
+    timeline_row = next_row_index
 
     if has_set_piece_chart:
         pivot_xg = (
@@ -1922,6 +2134,32 @@ def build_match_figure(
                 line_width=1,
             )
 
+    if has_set_piece_table and set_piece_table_section is not None and set_piece_table_row is not None:
+        _, table = set_piece_table_section
+        table = table.copy()
+        if not table.empty:
+            table = table.where(pd.notna(table), None)
+            figure.add_trace(
+                go.Table(
+                    header=dict(
+                        values=list(table.columns),
+                        fill_color="#222222",
+                        font=dict(color="white", size=14),
+                        align="left",
+                        height=44,
+                    ),
+                    cells=dict(
+                        values=[table[column].tolist() for column in table.columns],
+                        fill_color="#F5F5F5",
+                        font=dict(size=13),
+                        height=44,
+                        align="left",
+                    ),
+                ),
+                row=set_piece_table_row,
+                col=1,
+            )
+
     if not timeline.empty:
         for team, color in [(home, colors["home_main"]), (away, colors["away_main"])]:
             subset = timeline[timeline["squadName"] == team]
@@ -1975,21 +2213,32 @@ def build_match_figure(
         height=7800,
         width=1500,
         legend=dict(orientation="h", yanchor="bottom", y=1.08, xanchor="right", x=1),
-        margin=dict(t=80, r=60, l=80, b=80),
+        margin=dict(t=120, r=60, l=80, b=80),
         template="plotly_white",
     )
 
+    latest_squad_ratings = extract_latest_squad_ratings(squad_ratings, squad_ids, match_date)
+
     squad_rating_lookup: Dict[str, Dict[str, object]] = {}
+    for record in latest_squad_ratings.values():
+        team_name = record.get("squadName") or record.get("Squadname") or record.get("Team")
+        if not team_name:
+            continue
+        squad_rating_lookup[str(team_name)] = record
+
     if squad_ratings_table is not None and not squad_ratings_table.empty:
         for record in squad_ratings_table.to_dict("records"):
             team_name = record.get("squadName") or record.get("Squadname") or record.get("Team")
             if not team_name:
                 continue
-            squad_rating_lookup[str(team_name)] = record
+            existing = squad_rating_lookup.get(str(team_name), {})
+            merged = {**record, **existing}
+            merged.setdefault("squadName", team_name)
+            squad_rating_lookup[str(team_name)] = merged
 
     def build_rating_annotation(team_name: str) -> Optional[str]:
         if not squad_rating_lookup:
-            return None
+            return f"<b>{team_name}</b>"
 
         record = squad_rating_lookup.get(team_name)
         if record is None:
@@ -1998,7 +2247,7 @@ def build_match_figure(
                     record = value
                     break
         if record is None:
-            return None
+            return f"<b>{team_name}</b>"
 
         rating_value = record.get("value", record.get("Value"))
         date_value = record.get("date", record.get("Date", record.get("iterationId")))
@@ -2019,7 +2268,7 @@ def build_match_figure(
     home_logo = extract_team_logo(match_meta, "home")
     away_logo = extract_team_logo(match_meta, "away")
     logo_size = 0.12
-    logo_y = 1.12
+    logo_y = 1.08
 
     if home_logo:
         figure.add_layout_image(
