@@ -5,6 +5,41 @@ from impectPy.helpers import RateLimitedAPI, unnest_mappings_df, ForbiddenError
 from .matches import getMatchesFromHost
 from .iterations import getIterationsFromHost
 
+
+def _ensure_lost_duels_column(dataframe: pd.DataFrame) -> bool:
+    """Add a ``Lost Duels`` column derived from available duel components."""
+
+    if "Lost Duels" in dataframe.columns:
+        return True
+
+    column_lookup = {column.lower(): column for column in dataframe.columns}
+
+    component_candidates = [
+        column_lookup[key]
+        for key in ["lost ground duels", "lost aerial duels"]
+        if key in column_lookup
+    ]
+
+    if component_candidates:
+        dataframe["Lost Duels"] = (
+            dataframe[component_candidates]
+            .apply(pd.to_numeric, errors="coerce")
+            .sum(axis=1)
+            .fillna(0.0)
+        )
+        return True
+
+    duel_column = column_lookup.get("duels")
+    won_column = column_lookup.get("won duels")
+
+    if duel_column is not None and won_column is not None:
+        duels = pd.to_numeric(dataframe[duel_column], errors="coerce")
+        won_duels = pd.to_numeric(dataframe[won_column], errors="coerce")
+        dataframe["Lost Duels"] = (duels - won_duels).clip(lower=0).fillna(0.0)
+        return True
+
+    return False
+
 # define the allowed positions
 allowed_positions = [
   "GOALKEEPER",
@@ -383,6 +418,8 @@ def getPlayerMatchScoresFromHost(matches: list, connection: RateLimitedAPI, host
         "id": "playerId"
     })
 
+    has_lost_duels = _ensure_lost_duels_column(player_scores)
+
     # define column order
     order = [
         "matchId",
@@ -416,6 +453,9 @@ def getPlayerMatchScoresFromHost(matches: list, connection: RateLimitedAPI, host
 
     # add kpiNames to order
     order += scores["name"].to_list()
+
+    if has_lost_duels and "Lost Duels" not in order:
+        order.append("Lost Duels")
 
     # check if coaches are blacklisted
     if coaches_blacklisted:
@@ -697,6 +737,8 @@ def getPlayerIterationScoresFromHost(
     averages["playerId"] = averages["playerId"].astype(int)
     averages["iterationId"] = averages["iterationId"].astype(int)
 
+    has_lost_duels = _ensure_lost_duels_column(averages)
+
     # define column order
     order = [
         "iterationId",
@@ -722,6 +764,9 @@ def getPlayerIterationScoresFromHost(
 
     # add kpiNames to order
     order = order + scores.name.to_list()
+
+    if has_lost_duels and "Lost Duels" not in order:
+        order.append("Lost Duels")
 
     # select columns
     averages = averages[order]
