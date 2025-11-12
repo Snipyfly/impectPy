@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import requests
 import re
+import warnings
 from impectPy.helpers import RateLimitedAPI, ForbiddenError
 from impectPy.matches import getMatchesFromHost
 from impectPy.iterations import getIterationsFromHost
@@ -99,10 +100,12 @@ def getEventsFromHost(
         error_summary = "\n".join(
             [f"matchId {match}: {error_message}" for match, error_message in failed_event_matches]
         )
-        raise Exception(
-            "Failed to retrieve events for all supplied matches due to server errors. "
-            "Execution stopped.\n" + error_summary
+        warnings.warn(
+            "Failed to retrieve events for all supplied matches due to server errors.\n"
+            + error_summary,
+            RuntimeWarning
         )
+        return pd.DataFrame()
 
     if not event_frames:
         raise Exception("No events data could be retrieved for the supplied matches.")
