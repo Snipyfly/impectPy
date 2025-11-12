@@ -1034,11 +1034,130 @@ def normalize_by_pos(raw: pd.Series, positions: pd.Series) -> pd.Series:
 
     return scores.clip(0, 10)
 
+def normalise_duel_type(value: object) -> Optional[str]:
+    """Mappt beliebige Duel-Typwerte robust auf 'GROUND'/'AERIAL'/None."""
+    u = str(value).upper()
+    if "AERIAL" in u:
+        return "AERIAL"
+    if "GROUND" in u:
+        return "GROUND"
+    return None
+
+
+def compute_duel_absolutes(events: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    """
+    Leitet absolute Duellwerte pro Team ab – inklusive LOST aus Gegner-WON.
+    Gibt ein Dict zurück, das direkt in absolute_metrics passt, z. B.:
+    {'Won Ground Duels': {teamA: x, teamB: y}, 'Lost Ground Duels': {...}, ...}
+    """
+    required_cols = {"duelResult", "squadName"}
+    if events is None or events.empty or not required_cols.issubset(events.columns):
+        return {}
+
+    duels = events.dropna(subset=["duelResult", "squadName"]).copy()
+
+    type_col = next(
+        (c for c in [
+            "duelDuelType", "duelType", "duel_type", "duelCategory", "duelPhaseType"
+        ] if c in duels.columns),
+        None,
+    )
+    duels["duelTypeKey"] = duels[type_col].apply(normalise_duel_type) if type_col else None
+    duels["resKey"] = duels["duelResult"].astype(str).str.upper()
+
+    # Gewonnene Duelle zählen (verschiedene Sprach-/Labelvarianten robust abdecken)
+    won_mask = duels["resKey"].str.contains(r"(WON|WIN|GEWONNEN|SIEG)", regex=True)
+    won_tbl = (
+        duels[won_mask]
+        .groupby(["duelTypeKey", "squadName"])
+        .size()
+        .unstack("squadName", fill_value=0)
+        .astype(float)
+    )
+    if won_tbl.empty:
+        return {}
+
+    teams = list(won_tbl.columns)
+
+    # LOST = Gegner-WON (bei genau zwei Teams trivialer Swap, sonst Fallback)
+    if len(teams) == 2:
+        a, b = teams
+        lost_tbl = won_tbl.rename(columns={a: b, b: a})
+    else:
+        totals = won_tbl.sum(axis=1)
+        lost_tbl = (totals.to_frame("total").sub(won_tbl, axis=0)).clip(lower=0.0)
+        lost_tbl.columns = teams
+
+    out: Dict[str, Dict[str, float]] = {}
+
+    def push_pair(key: Optional[str], won_label: str, lost_label: str) -> None:
+        if key is None:
+            won_sum = won_tbl.sum(axis=0)
+            lost_sum = lost_tbl.sum(axis=0)
+        else:
+            if key not in won_tbl.index:
+                return
+            won_sum = won_tbl.loc[key]
+            lost_sum = lost_tbl.loc[key]
+        for team in teams:
+            out.setdefault(won_label, {})[team] = float(won_sum.get(team, 0.0))
+            out.setdefault(lost_label, {})[team] = float(lost_sum.get(team, 0.0))
+
+    # Ground-/Aerial-spezifisch + Gesamt (alle Duelle)
+    push_pair("GROUND", "Won Ground Duels", "Lost Ground Duels")
+    push_pair("AERIAL", "Won Aerial Duels", "Lost Aerial Duels")
+    push_pair(None, "Won Duels", "Lost Duels")
+
+    return out
+
+def probe_duel_support(token: str, iteration_id: int, max_matches: int = 5) -> None:
+    import pandas as pd
+    import impectPy as ip
+
+    print(f"\n🔎 Prüfe Iteration {iteration_id} auf Duel-Event-Support …")
+    matches = pd.DataFrame(ip.getMatches(iteration_id, token)).head(max_matches)
+    needed_cols = {"duelResult", "duelPlayerId", "duelOpponentPlayerId", "duelType"}
+    found_any = False
+
+    for m in matches.itertuples():
+        ev = pd.DataFrame(ip.getEvents([m.id], token=token))
+        if ev.empty:
+            continue
+        cols = set(ev.columns)
+        has_cols = needed_cols & cols
+        non_null = {c for c in has_cols if ev[c].notna().any()}
+        if non_null:
+            print(f"✅ matchId={m.id}: hat Felder {sorted(non_null)} (mit Daten)")
+            found_any = True
+        else:
+            agg_cols = {c for c in ev.columns if "DUELS" in c or "DUEL" in c}
+            print(f"➖ matchId={m.id}: keine echten Duel-Logs; nur {sorted(agg_cols)[:6]} …")
+
+    if not found_any:
+        print("⚠️ In den geprüften Spielen dieser Iteration keine echten Duel-Events gefunden.")
+
+def main() -> None:
+    username = USERNAME or _prompt("Benutzername (Impect): ", "")
+    password = PASSWORD or _prompt("Passwort (Impect): ", "")
+    if not username or not password:
+        raise ValueError("Es werden gültige Zugangsdaten benötigt, um das Beispiel auszuführen.")
+
+    token = get_access_token(username=username, password=password)
+    iteration_id = choose_iteration(token)
+
+    # <<< HIER EINMAL PROBE-LAUF >>>
+    probe_duel_support(token, iteration_id, max_matches=8)
+
+    matchplan = get_matchplan(token, iteration_id)
+    match_id = choose_match(matchplan)
+    ...
 
 def compute_team_kpis(events: pd.DataFrame) -> pd.DataFrame:
     """Aggregate a selection of team level KPIs for the figure."""
 
     events = events.copy()
+    # --- NEU: teamübergreifende Duell-Absolutwerte (WON/LOST) robust ableiten ---
+    duel_abs_global = compute_duel_absolutes(events)
     groups = events.groupby(["squadId", "squadName"])
 
     rows = []
@@ -1085,14 +1204,38 @@ def compute_team_kpis(events: pd.DataFrame) -> pd.DataFrame:
             absolute_metrics.setdefault("Goal Threat gesamt (pxT)", {})[squad_name] = float(
                 row["Goal Threat gesamt (pxT)"]
             )
+        # --- NEU: sichere Duell-Absolutwerte aus der teamübergreifenden Ableitung verwenden ---
+        # Dadurch haben beide Teams immer konsistente WON/LOST, auch wenn der Feed LOST nicht explizit loggt.
+        if duel_abs_global:
+            for metric_label in ["Won Ground Duels", "Lost Ground Duels",
+                                 "Won Aerial Duels", "Lost Aerial Duels",
+                                 "Won Duels", "Lost Duels"]:
+                per_team = duel_abs_global.get(metric_label)
+                if per_team and squad_name in per_team:
+                    value = float(per_team[squad_name])
+                    row[metric_label] = value
+                    absolute_metrics.setdefault(metric_label, {})[squad_name] = value
+
+        DUEL_LABELS = {
+            "Won Ground Duels", "Lost Ground Duels",
+            "Won Aerial Duels", "Lost Aerial Duels",
+            "Won Duels", "Lost Duels",
+        }
 
         for column, label in TEAM_KPI_LABELS:
             if column == "GOALS":
                 continue
             if column in subset:
                 value = subset[column].sum()
-                row[label] = value
-                absolute_metrics.setdefault(label, {})[squad_name] = float(value)
+
+                # NEU: Duel-Labels nur setzen, wenn noch NICHT via duel_abs_global belegt
+                if label in DUEL_LABELS:
+                    if label not in row or pd.isna(row[label]):
+                        row[label] = value
+                        absolute_metrics.setdefault(label, {})[squad_name] = float(value)
+                else:
+                    row[label] = value
+                    absolute_metrics.setdefault(label, {})[squad_name] = float(value)
 
         if "OFFENSIVE_TOUCHES_IN_PITCH_POSITION_FINAL_THIRD" in subset:
             row.setdefault(
@@ -2514,6 +2657,50 @@ def main() -> None:
     print("📦 Lade Events + KPIs via impectPy.getEvents(...)")
     events = pd.DataFrame(ip.getEvents([match_id], token=token))
     print(f"✅ {len(events)} Events im DataFrame")
+
+    pd.set_option("display.max_columns", None)
+    pd.set_option("display.width", 200)
+
+    duel_cols = [c for c in events.columns if "duel" in c.lower() or "opponent" in c.lower()]
+    print("🔎 Duel-/Opponent-Spalten:", duel_cols)
+
+    result_col = next((c for c in ["duelResult", "duelOutcome", "contestOutcome"] if c in events.columns), None)
+    type_col = next((c for c in ["duelDuelType", "duelType", "duelCategory", "duelPhaseType"] if c in events.columns),
+                    None)
+
+    text_cols = [c for c in ["eventType", "actionType", "phase", "subPhase", "category"] if c in events.columns]
+    text_mask = pd.Series(False, index=events.index)
+    for c in text_cols:
+        text_mask |= events[c].astype(str).str.contains("DUEL", case=False, na=False)
+
+    value_mask = pd.Series(False, index=events.index)
+    for c in duel_cols:
+        value_mask |= events[c].notna()
+
+    duel_mask = text_mask | value_mask
+    if result_col:
+        duel_mask |= events[result_col].notna()
+
+    duels = events[duel_mask].copy()
+    print(f"✅ Gefundene Duel-Events: {len(duels)}")
+
+    if not duels.empty:
+        sample = duels.sample(1, random_state=1)
+        print("\n🎯 Beispiel-Duel-Event (vollständige Row):")
+        print(sample.T)
+
+        keep = ["id", "gameTime", "minute", "squadName", "playerName", "playerId",
+                result_col, type_col,
+                "duelOpponentId", "duelOpponentPlayerId", "opponentPlayerId", "opponentId",
+                "secondPlayerId", "otherPlayerId", "losingPlayerId"]
+        keep = [c for c in keep if c in duels.columns]
+        print("\n🧩 Kompakte Sicht auf 10 Duel-Events:")
+        print(duels[keep].head(10).to_string(index=False))
+
+        duels[keep].head(100).to_csv("duel_sample.csv", index=False)
+        print("\n💾 Gespeichert als duel_sample.csv (erste 100 Duel-Events).")
+    else:
+        print("⚠️ Keine Duel-Events gefunden – evtl. enthält das Match keine Duelle.")
 
     print("📦 Lade PlayerMatchsums...")
     player_matchsums = ip.getPlayerMatchsums([match_id], token)
