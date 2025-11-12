@@ -1077,6 +1077,20 @@ def compute_duel_absolutes(events: pd.DataFrame) -> Dict[str, Dict[str, float]]:
     if won_tbl.empty:
         return {}
 
+    # Sicherstellen, dass wirklich beide Teams vorhanden sind – je nach Feed können
+    # Duelle nur für das aktionsausführende Team geloggt werden.  In diesem Fall
+    # fehlen im gewonnenen DataFrame die Spalten des Gegners.  Wir ergänzen diese
+    # dann mit Nullen, sodass die spätere Spiegelung (Won -> Lost) sauber
+    # funktioniert und die verlorenen Duelle nicht fälschlicherweise als 0
+    # ausgewiesen werden.
+    match_teams = duels["squadName"].dropna().unique().tolist()
+    if match_teams:
+        for squad in match_teams:
+            if squad not in won_tbl.columns:
+                won_tbl[squad] = 0.0
+        # Die Reihenfolge der Spalten deterministisch halten.
+        won_tbl = won_tbl.reindex(columns=match_teams)
+
     teams = list(won_tbl.columns)
 
     # LOST = Gegner-WON (bei genau zwei Teams trivialer Swap, sonst Fallback)
