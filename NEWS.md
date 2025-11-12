@@ -1,3 +1,9 @@
+# impectPy 2.5.3
+
+## Minor Changes
+* add a derived "Lost Duels" column to player match and iteration scores to improve player rating breakdowns
+* ensure set piece xG aggregates sum correctly by expanding category-level breakdowns and preserving source totals
+
 # impectPy 2.5.2
 
 ## Minor Changes

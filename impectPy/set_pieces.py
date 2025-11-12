@@ -5,6 +5,119 @@ from impectPy.helpers import RateLimitedAPI
 from .matches import getMatchesFromHost
 from .iterations import getIterationsFromHost
 import re
+from typing import Any, Dict, List, Tuple
+
+
+def _normalize_aggregate_key(label: Any) -> str:
+    """Return a clean column suffix derived from ``label``."""
+
+    text = str(label) if label is not None else "UNSPECIFIED"
+    normalized = re.sub(r"[^0-9A-Za-z]+", "_", text).strip("_")
+    return normalized.upper() if normalized else "UNSPECIFIED"
+
+
+def _list_entry_to_dict(entries: List[Any]) -> Dict[str, Any]:
+    """Convert a list of aggregate entries into a dictionary."""
+
+    result: Dict[str, Any] = {}
+    for index, entry in enumerate(entries):
+        if isinstance(entry, dict):
+            key = None
+            for candidate in [
+                "category",
+                "type",
+                "name",
+                "label",
+                "key",
+                "id",
+            ]:
+                if candidate in entry and entry[candidate] not in (None, ""):
+                    key = entry[candidate]
+                    break
+
+            value = entry.get("value")
+            if value is None:
+                for candidate in ["amount", "sum", "total"]:
+                    if candidate in entry:
+                        value = entry[candidate]
+                        break
+            if key is None:
+                if len(entry) == 1:
+                    key, value = next(iter(entry.items()))
+                else:
+                    key = str(index)
+            result[str(key)] = value
+        else:
+            result[str(index)] = entry
+    return result
+
+
+def _expand_nested_aggregate_column(
+    dataframe: pd.DataFrame,
+    column: str,
+) -> Tuple[pd.DataFrame, List[str]]:
+    """Expand nested aggregate data and return new columns."""
+
+    if column not in dataframe.columns:
+        return dataframe, []
+
+    series = dataframe[column]
+    if not series.dropna().apply(lambda value: isinstance(value, (dict, list))).any():
+        return dataframe, []
+
+    normalized = []
+    for value in series:
+        if isinstance(value, dict):
+            normalized.append(value)
+        elif isinstance(value, list):
+            normalized.append(_list_entry_to_dict(value))
+        else:
+            normalized.append({})
+
+    if not any(normalized):
+        return dataframe, []
+
+    expanded = pd.json_normalize(normalized).fillna(0.0)
+    expanded.columns = [
+        f"{column}_{_normalize_aggregate_key(name)}" for name in expanded.columns
+    ]
+
+    numeric_expanded = expanded.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+
+    total_candidates = [
+        col
+        for col in numeric_expanded.columns
+        if col.upper().endswith("_TOTAL")
+        or col.upper().endswith("_SUM")
+        or col.upper().endswith("_ALL")
+    ]
+
+    raw_total = None
+    if total_candidates:
+        total_column = total_candidates[0]
+        raw_total = numeric_expanded[total_column]
+        numeric_expanded = numeric_expanded.drop(columns=[total_column])
+
+    if not numeric_expanded.empty:
+        recomputed_total = numeric_expanded.sum(axis=1, numeric_only=True)
+    else:
+        recomputed_total = (
+            raw_total.fillna(0.0) if raw_total is not None else pd.Series(0.0, index=dataframe.index)
+        )
+
+    result = dataframe.drop(columns=[column]).copy()
+    result[column] = recomputed_total
+
+    new_columns: List[str] = []
+    if raw_total is not None:
+        result[f"{column}_SOURCE_TOTAL"] = raw_total
+        new_columns.append(f"{column}_SOURCE_TOTAL")
+
+    if not numeric_expanded.empty:
+        result = pd.concat([result, numeric_expanded], axis=1)
+        new_columns.extend(numeric_expanded.columns.tolist())
+
+    return result, new_columns
 
 ######
 #
@@ -224,6 +337,17 @@ def getSetPiecesFromHost(matches: list, connection: RateLimitedAPI, host: str) -
         "setPieceSubPhaseAggregatesBYPASSED_DEFENDERS": "setPieceSubPhase_BYPASSED_DEFENDERS"
     })
 
+    aggregate_columns = [
+        "setPieceSubPhase_SHOT_XG",
+        "setPieceSubPhase_PACKING_XG",
+        "setPieceSubPhase_POSTSHOT_XG",
+    ]
+
+    dynamic_columns: List[str] = []
+    for column in aggregate_columns:
+        set_pieces, new_columns = _expand_nested_aggregate_column(set_pieces, column)
+        dynamic_columns.extend(new_columns)
+
     # define desired column order
     order = [
         "matchId",
@@ -270,6 +394,11 @@ def getSetPiecesFromHost(matches: list, connection: RateLimitedAPI, host: str) -
         "setPieceSubPhase_BYPASSED_OPPONENTS",
         "setPieceSubPhase_BYPASSED_DEFENDERS",
     ]
+
+    if dynamic_columns:
+        for column in dict.fromkeys(dynamic_columns):
+            if column not in order:
+                order.append(column)
 
     # reorder data
     set_pieces = set_pieces[order]
