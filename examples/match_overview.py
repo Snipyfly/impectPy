@@ -624,7 +624,7 @@ def extract_latest_squad_ratings(
         else:
             ordered = subset.sort_index(ascending=False)
 
-        if ordered.empty():
+        if ordered.empty:
             continue
 
         record = ordered.iloc[0]
@@ -1301,6 +1301,9 @@ def compute_player_ratings(
     events["position"] = events["position_canonical"].fillna(events["position"]).fillna("Unknown")
     events = events.drop(columns="position_canonical")
 
+    if "playerId" in events.columns:
+        events["playerId"] = pd.to_numeric(events["playerId"], errors="ignore")
+
     aggregations = {column: "sum" for column in [
         "SHOT_XG",
         "PACKING_XG",
@@ -1350,7 +1353,10 @@ def compute_player_ratings(
         duel_events = events[(events["duelPlayerId"].notna()) & (events["duelResult"].notna())]
         if not duel_events.empty:
             duel_events = duel_events.copy()
+            duel_events["duelPlayerId"] = pd.to_numeric(duel_events["duelPlayerId"], errors="ignore")
             duel_results = duel_events["duelResult"].astype(str).str.upper()
+            lost_pattern = r"(LOST|LOSS|DEFEAT|VERLOREN)"
+            won_pattern = r"(WON|WIN|GEWONNEN)"
 
             def normalise_counts(counts: pd.Series) -> pd.Series:
                 if counts.empty:
@@ -1364,7 +1370,7 @@ def compute_player_ratings(
                     counts.index = counts.index.astype("Int64")
                 return counts.astype(float)
 
-            lost_duels = duel_events[duel_results.str.contains("LOST", na=False)].groupby("duelPlayerId").size()
+            lost_duels = duel_events[duel_results.str.contains(lost_pattern, na=False)].groupby("duelPlayerId").size()
             possible_opponent_columns = [
                 column
                 for column in [
@@ -1376,11 +1382,12 @@ def compute_player_ratings(
                 if column in duel_events.columns
             ]
             if possible_opponent_columns:
-                winner_mask = duel_results.str.contains("WON", na=False)
+                winner_mask = duel_results.str.contains(won_pattern, na=False)
                 for column in possible_opponent_columns:
                     opponent_series = duel_events.loc[winner_mask, column]
                     if opponent_series.empty:
                         continue
+                    opponent_series = pd.to_numeric(opponent_series, errors="ignore")
                     opponent_counts = opponent_series.value_counts()
                     opponent_counts = normalise_counts(opponent_counts)
                     if not opponent_counts.empty:
@@ -1399,7 +1406,7 @@ def compute_player_ratings(
                 )
                 players = players.drop(columns=["lost_duels_fallback"])
 
-            won_duels = duel_events[duel_results.str.contains("WON", na=False)].groupby("duelPlayerId").size()
+            won_duels = duel_events[duel_results.str.contains(won_pattern, na=False)].groupby("duelPlayerId").size()
             if not won_duels.empty:
                 won_duels = normalise_counts(won_duels).rename("won_duels_fallback")
                 players = players.merge(
