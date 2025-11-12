@@ -1,4 +1,6 @@
 # load packages
+import warnings
+
 import pandas as pd
 import requests
 from impectPy.helpers import RateLimitedAPI, unnest_mappings_df, ForbiddenError
@@ -14,6 +16,8 @@ def _ensure_lost_duels_column(dataframe: pd.DataFrame) -> bool:
 
     column_lookup = {column.lower(): column for column in dataframe.columns}
 
+    lost_duels = pd.Series(index=dataframe.index, dtype="float64")
+
     component_candidates = [
         column_lookup[key]
         for key in ["lost ground duels", "lost aerial duels"]
@@ -21,13 +25,11 @@ def _ensure_lost_duels_column(dataframe: pd.DataFrame) -> bool:
     ]
 
     if component_candidates:
-        dataframe["Lost Duels"] = (
-            dataframe[component_candidates]
-            .apply(pd.to_numeric, errors="coerce")
-            .sum(axis=1)
-            .fillna(0.0)
+        components = dataframe[component_candidates].apply(
+            pd.to_numeric, errors="coerce"
         )
-        return True
+        component_sum = components.sum(axis=1, min_count=1)
+        lost_duels = component_sum
 
     duel_column = column_lookup.get("duels")
     won_column = column_lookup.get("won duels")
@@ -35,7 +37,31 @@ def _ensure_lost_duels_column(dataframe: pd.DataFrame) -> bool:
     if duel_column is not None and won_column is not None:
         duels = pd.to_numeric(dataframe[duel_column], errors="coerce")
         won_duels = pd.to_numeric(dataframe[won_column], errors="coerce")
-        dataframe["Lost Duels"] = (duels - won_duels).clip(lower=0).fillna(0.0)
+        diff = duels - won_duels
+        negative_mask = diff < 0
+        if negative_mask.any():
+            warnings.warn(
+                "Encountered won duel counts larger than total duels; "
+                "these rows were left empty in 'Lost Duels'.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        diff = diff.where(~negative_mask)
+        diff = diff.where(~(duels.isna() | won_duels.isna()))
+
+        if component_candidates:
+            fallback_mask = lost_duels.isna() & diff.notna()
+            if fallback_mask.any():
+                warnings.warn(
+                    "Falling back to 'Duels - Won Duels' for rows without duel "
+                    "components to compute 'Lost Duels'.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        lost_duels = lost_duels.combine_first(diff)
+
+    if lost_duels.notna().any():
+        dataframe["Lost Duels"] = lost_duels
         return True
 
     return False
