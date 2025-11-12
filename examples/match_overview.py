@@ -737,10 +737,17 @@ def summarise_set_pieces(set_pieces: Optional[pd.DataFrame]) -> pd.DataFrame:
             return "Ecken"
         if "free" in lower or "freisto" in lower:
             return "Freistöße"
+        if "pen" in lower or "elfmeter" in lower:
+            return "Elfmeter"
+        if "throw" in lower or "einwurf" in lower:
+            return "Einwürfe"
+        if "kick" in lower and "off" in lower:
+            return "Anstöße"
+        if "goal" in lower and "kick" in lower:
+            return "Abstöße"
         return label
 
     summary["Kategorie"] = summary["Kategorie"].apply(_map_category)
-    summary = summary[summary["Kategorie"].isin(["Ecken", "Freistöße"])].copy()
 
     if summary.empty:
         return summary
@@ -1359,72 +1366,79 @@ def compute_player_ratings(
         duel_events = events[(events["duelPlayerId"].notna()) & (events["duelResult"].notna())]
         if not duel_events.empty:
             duel_events = duel_events.copy()
-            duel_events["duelPlayerId"] = pd.to_numeric(duel_events["duelPlayerId"], errors="ignore")
-            duel_results = duel_events["duelResult"].astype(str).str.upper()
-            lost_pattern = r"(LOST|LOSS|DEFEAT|VERLOREN)"
-            won_pattern = r"(WON|WIN|GEWONNEN)"
+            duel_events["duelPlayerId"] = pd.to_numeric(duel_events["duelPlayerId"], errors="coerce")
+            duel_events = duel_events[duel_events["duelPlayerId"].notna()]
+            if not duel_events.empty:
+                duel_events["duelPlayerId"] = duel_events["duelPlayerId"].astype(int)
+                duel_events["duelResult_upper"] = duel_events["duelResult"].astype(str).str.upper()
 
-            def normalise_counts(counts: pd.Series) -> pd.Series:
-                if counts.empty:
-                    return counts
-                normalized_index = pd.to_numeric(counts.index, errors="coerce")
-                counts.index = normalized_index
-                counts = counts[~pd.isna(counts.index)]
-                try:
-                    counts.index = counts.index.astype(int)
-                except Exception:
-                    counts.index = counts.index.astype("Int64")
-                return counts.astype(float)
+                lost_pattern = r"(LOST|LOSS|DEFEAT|VERLOREN)"
+                won_pattern = r"(WON|WIN|GEWONNEN|SIEG)"
 
-            lost_duels = duel_events[duel_results.str.contains(lost_pattern, na=False)].groupby("duelPlayerId").size()
-            possible_opponent_columns = [
-                column
-                for column in [
-                    "duelOpponentId",
-                    "duelOpponentPlayerId",
-                    "opponentPlayerId",
-                    "opponentId",
+                lost_mask = duel_events["duelResult_upper"].str.contains(lost_pattern, na=False)
+                won_mask = duel_events["duelResult_upper"].str.contains(won_pattern, na=False)
+
+                lost_counts = duel_events.loc[lost_mask, "duelPlayerId"].value_counts()
+                won_counts = duel_events.loc[won_mask, "duelPlayerId"].value_counts()
+
+                opponent_columns = [
+                    column
+                    for column in [
+                        "duelOpponentId",
+                        "duelOpponentPlayerId",
+                        "opponentPlayerId",
+                        "opponentId",
+                    ]
+                    if column in duel_events.columns
                 ]
-                if column in duel_events.columns
-            ]
-            if possible_opponent_columns:
-                winner_mask = duel_results.str.contains(won_pattern, na=False)
-                for column in possible_opponent_columns:
-                    opponent_series = duel_events.loc[winner_mask, column]
-                    if opponent_series.empty:
-                        continue
-                    opponent_series = pd.to_numeric(opponent_series, errors="ignore")
-                    opponent_counts = opponent_series.value_counts()
-                    opponent_counts = normalise_counts(opponent_counts)
-                    if not opponent_counts.empty:
-                        lost_duels = lost_duels.add(opponent_counts, fill_value=0)
+                if opponent_columns:
+                    for column in opponent_columns:
+                        opponent_series = pd.to_numeric(duel_events[column], errors="coerce")
+                        if opponent_series.notna().any():
+                            if won_mask.any():
+                                opponent_lost = opponent_series[won_mask].dropna().value_counts()
+                                lost_counts = lost_counts.add(opponent_lost, fill_value=0)
+                            if lost_mask.any():
+                                opponent_won = opponent_series[lost_mask].dropna().value_counts()
+                                won_counts = won_counts.add(opponent_won, fill_value=0)
 
-            if not lost_duels.empty:
-                lost_duels = normalise_counts(lost_duels).rename("lost_duels_fallback")
-                players = players.merge(
-                    lost_duels,
-                    left_on="playerId",
-                    right_index=True,
-                    how="left",
-                )
-                players["lost_duels"] = players["lost_duels"].where(
-                    players["lost_duels"] > 0, players["lost_duels_fallback"].fillna(0)
-                )
-                players = players.drop(columns=["lost_duels_fallback"])
+                summary_data: Dict[str, pd.Series] = {}
+                if not lost_counts.empty:
+                    lost_counts = lost_counts[lost_counts.index.notna()].astype(float)
+                    try:
+                        lost_counts.index = lost_counts.index.astype(int)
+                    except Exception:
+                        lost_counts.index = lost_counts.index.astype("Int64")
+                    summary_data["lost_duels_events"] = lost_counts
+                if not won_counts.empty:
+                    won_counts = won_counts[won_counts.index.notna()].astype(float)
+                    try:
+                        won_counts.index = won_counts.index.astype(int)
+                    except Exception:
+                        won_counts.index = won_counts.index.astype("Int64")
+                    summary_data["won_duels_events"] = won_counts
 
-            won_duels = duel_events[duel_results.str.contains(won_pattern, na=False)].groupby("duelPlayerId").size()
-            if not won_duels.empty:
-                won_duels = normalise_counts(won_duels).rename("won_duels_fallback")
-                players = players.merge(
-                    won_duels,
-                    left_on="playerId",
-                    right_index=True,
-                    how="left",
-                )
-                players["won_duels"] = players["won_duels"].where(
-                    players["won_duels"] > 0, players["won_duels_fallback"].fillna(0)
-                )
-                players = players.drop(columns=["won_duels_fallback"])
+                if summary_data:
+                    duel_summary = pd.DataFrame(summary_data)
+                    duel_summary.index.name = "playerId"
+                    players = players.merge(
+                        duel_summary,
+                        left_on="playerId",
+                        right_index=True,
+                        how="left",
+                    )
+                    for column, fallback_column in [
+                        ("lost_duels", "lost_duels_events"),
+                        ("won_duels", "won_duels_events"),
+                    ]:
+                        if fallback_column in players.columns:
+                            players[column] = pd.to_numeric(players[column], errors="coerce")
+                            players[column] = players[column].mask(players[column] <= 0, np.nan)
+                            players[column] = players[column].combine_first(players[fallback_column])
+                            players[column] = players[column].fillna(0.0)
+                    players = players.drop(
+                        columns=[col for col in ["lost_duels_events", "won_duels_events"] if col in players.columns]
+                    )
 
     if players["presses"].sum() == 0 and "pressingPlayerId" in events.columns:
         press_events = events[events["pressingPlayerId"].notna()]
