@@ -30,9 +30,14 @@ from typing import Iterable, Optional
 import pandas as pd
 import requests
 
-from .config import Config
-from .helpers import RateLimitedAPI
-from .matches import getMatchesFromHost
+if __package__ in (None, ""):
+    from config import Config
+    from helpers import RateLimitedAPI
+    from matches import getMatchesFromHost
+else:
+    from .config import Config
+    from .helpers import RateLimitedAPI
+    from .matches import getMatchesFromHost
 
 
 @dataclass
