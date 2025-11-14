@@ -9,11 +9,11 @@ the corresponding DFL identifier.
 Typical usage
 -------------
 
->>> import impectPy as ip
->>> token = ip.getAccessToken("username@example.com", "password")
->>> iterations = [518, 522]
->>> team_lookup = ip.getDflTeamLookup(iterations, token)
->>> match_lookup = ip.getDflMatchLookup(iterations, token)
+>>> import impectPy as ip  # doctest: +SKIP
+>>> token = ip.getAccessToken("username@example.com", "password")  # doctest: +SKIP
+>>> iterations = [518, 522]  # doctest: +SKIP
+>>> team_lookup = ip.getDflTeamLookup(iterations, token)  # doctest: +SKIP
+>>> match_lookup = ip.getDflMatchLookup(iterations, token)  # doctest: +SKIP
 
 Both helper functions return pandas ``DataFrame`` objects that contain
 Impect and DFL identifiers side-by-side.  These lookup tables can then be
