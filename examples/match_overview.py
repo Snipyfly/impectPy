@@ -1075,16 +1075,32 @@ def load_additional_match_data(
 
     additional: Dict[str, Optional[pd.DataFrame]] = {}
 
+    dfl_status: Optional[str] = None
     if should_fetch_dfl_duels():
-        additional["dfl_duels"] = safe_api_call(
+        dfl_duels = safe_api_call(
             "DFL Zweikampfdaten",
             load_dfl_duel_data,
             match_id=match_id,
             iteration_id=iteration_id,
             token=token,
         )
+        if isinstance(dfl_duels, pd.DataFrame) and dfl_duels.empty:
+            dfl_status = (
+                "DFL-Zweikampfdaten abgerufen, jedoch ohne auswertbare Einträge."
+            )
+        elif dfl_duels is None:
+            dfl_status = (
+                "DFL-Zweikampfdaten konnten nicht geladen werden. Siehe Meldung oben."
+            )
+        additional["dfl_duels"] = dfl_duels
     else:
+        dfl_status = (
+            "DFL_DUELS_URL_TEMPLATE ist nicht gesetzt. Setzen Sie die "
+            "Umgebungsvariable (z. B. export DFL_DUELS_URL_TEMPLATE=\"https://...\") "
+            "und optional DFL_API_TOKEN, um DFL-Zweikampfdaten zu laden."
+        )
         additional["dfl_duels"] = None
+    additional["dfl_duels_status"] = dfl_status
 
     additional["player_scores"] = safe_api_call(
         "Player Match Scores",
@@ -3037,7 +3053,11 @@ def main() -> None:
         if len(dfl_duels) > len(preview):
             print(f"... ({len(dfl_duels)} Zeilen insgesamt)")
     else:
-        print("\nℹ️ Keine DFL-Zweikampfdaten verfügbar oder Abruf übersprungen.")
+        status_message = additional_data.get("dfl_duels_status")
+        if status_message:
+            print(f"\nℹ️ {status_message}")
+        else:
+            print("\nℹ️ Keine DFL-Zweikampfdaten verfügbar oder Abruf übersprungen.")
 
     team_kpis = compute_team_kpis(events, dfl_duels=dfl_duels)
     phase_xg = compute_xg_by_phase(events)
