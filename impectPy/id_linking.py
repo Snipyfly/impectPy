@@ -10,7 +10,7 @@ Typical usage
 -------------
 
 >>> import impectPy as ip
->>> token = ip.getAccessToken(username, password)
+>>> token = ip.getAccessToken("username@example.com", "password")
 >>> iterations = [518, 522]
 >>> team_lookup = ip.getDflTeamLookup(iterations, token)
 >>> match_lookup = ip.getDflMatchLookup(iterations, token)
