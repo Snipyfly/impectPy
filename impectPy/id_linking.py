@@ -24,6 +24,7 @@ needs to call either API.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 import unicodedata
 from typing import Iterable, Optional
 
@@ -52,14 +53,14 @@ class _ProviderColumns:
 def _provider_columns(provider: str) -> _ProviderColumns:
     """Return the column names used by the API for a given provider."""
 
-    if not provider:
+    if not provider or not provider.strip():
         raise ValueError("Provider name must not be empty.")
 
-    camel_provider = provider[0].upper() + provider[1:]
+    provider_lower_camel, provider_upper_camel = _normalise_provider_name(provider)
     return _ProviderColumns(
-        match=f"{provider}Id",
-        home_team=f"homeSquad{camel_provider}Id",
-        away_team=f"awaySquad{camel_provider}Id",
+        match=f"{provider_lower_camel}Id",
+        home_team=f"homeSquad{provider_upper_camel}Id",
+        away_team=f"awaySquad{provider_upper_camel}Id",
     )
 
 
@@ -229,6 +230,39 @@ def getDflTeamLookup(
     squads["impectSquadNameNormalized"] = squads["impectSquadName"].map(_normalise_text)
 
     return squads.reset_index(drop=True)
+
+
+_CANONICAL_PROVIDER_NAMES = {
+    "heimspiel": ("heimSpiel", "HeimSpiel"),
+}
+
+
+def _normalise_provider_name(provider: str) -> tuple[str, str]:
+    """Return lower and upper camel-case representations of a provider name."""
+
+    stripped = provider.strip()
+    if not stripped:
+        raise ValueError("Provider name must not be empty.")
+
+    sanitized = re.sub(r"[^0-9A-Za-z]+", "", stripped)
+    if not sanitized:
+        raise ValueError("Provider name must contain alphanumeric characters.")
+
+    canonical = _CANONICAL_PROVIDER_NAMES.get(sanitized.lower())
+    if canonical:
+        return canonical
+
+    parts = re.findall(r"[A-Z]?[a-z]+|[0-9]+|[A-Z]+(?=[A-Z]|$)", stripped)
+    if not parts:
+        parts = [sanitized]
+
+    parts = [part.lower() for part in parts if part]
+    if not parts:
+        raise ValueError("Provider name must contain alphanumeric characters.")
+
+    lower_camel = parts[0] + "".join(part.capitalize() for part in parts[1:])
+    upper_camel = "".join(part.capitalize() for part in parts)
+    return lower_camel, upper_camel
 
 
 __all__ = ["getDflMatchLookup", "getDflTeamLookup"]
