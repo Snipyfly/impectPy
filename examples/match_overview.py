@@ -31,12 +31,14 @@ timeline and individual player ratings.
 from __future__ import annotations
 
 import os
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+import requests
 
 from pandas.api.types import is_datetime64_any_dtype, is_numeric_dtype
 
@@ -61,6 +63,18 @@ DEFAULT_PROFILE_POSITIONS = [
     "RIGHT_WINGER",
     "CENTER_FORWARD",
 ]
+
+# Optional configuration for fetching duel data from the DFL/Heimspiel interface.
+# ``DFL_DUELS_URL_TEMPLATE`` should be set to an URL template that accepts either
+# ``{match_id}`` or ``{dfl_match_id}`` placeholders.  Example::
+#
+#     export DFL_DUELS_URL_TEMPLATE="https://example.api/matches/{match_id}/duels"
+#
+# The API token is passed as Bearer token if ``DFL_API_TOKEN`` is configured.
+DFL_DUELS_URL_TEMPLATE = os.getenv("DFL_DUELS_URL_TEMPLATE", "").strip()
+DFL_API_TOKEN = os.getenv("DFL_API_TOKEN", "").strip()
+DFL_API_TIMEOUT = os.getenv("DFL_API_TIMEOUT", "15").strip()
+DFL_API_USER_AGENT = os.getenv("DFL_API_USER_AGENT", "impectPy-match-overview/1.0").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +412,100 @@ def extract_team_logo(match_meta: Dict[str, object], side: str) -> Optional[str]
         https_candidates = [value for value in candidates if value.startswith("https://")]
         return https_candidates[0] if https_candidates else candidates[0]
     return None
+
+
+def should_fetch_dfl_duels() -> bool:
+    """Return ``True`` if the environment is configured for DFL duel data."""
+
+    return bool(DFL_DUELS_URL_TEMPLATE)
+
+
+def _parse_dfl_timeout(default: float = 15.0) -> float:
+    """Return the configured timeout for the DFL API with sensible fallbacks."""
+
+    try:
+        value = float(DFL_API_TIMEOUT)
+    except (TypeError, ValueError):
+        return default
+    if value <= 0:
+        return default
+    return value
+
+
+def normalise_dfl_duels_payload(payload: Any) -> pd.DataFrame:
+    """Return a normalised dataframe for duel payloads provided by the DFL API."""
+
+    if payload is None:
+        return pd.DataFrame()
+
+    data = payload
+    if isinstance(data, dict):
+        for key in ("data", "items", "results", "payload", "matches", "content"):
+            candidate = data.get(key)
+            if isinstance(candidate, list):
+                data = candidate
+                break
+        else:
+            data = [data]
+
+    if isinstance(data, dict):
+        data = [data]
+
+    if not isinstance(data, list):
+        return pd.DataFrame()
+
+    rows = [entry for entry in data if isinstance(entry, dict)]
+    if not rows:
+        return pd.DataFrame()
+
+    frame = pd.json_normalize(rows)
+    if frame.empty:
+        return frame
+
+    def find_column(candidates: Sequence[str]) -> Optional[str]:
+        for candidate in candidates:
+            candidate_lower = candidate.lower()
+            for column in frame.columns:
+                lower = column.lower()
+                if lower == candidate_lower:
+                    return column
+                if lower.endswith(candidate_lower):
+                    return column
+                if candidate_lower in lower:
+                    return column
+        return None
+
+    result = pd.DataFrame(index=frame.index)
+
+    team_id_col = find_column(["teamid", "team_id", "squadid", "dflteamid", "clubid"])
+    team_name_col = find_column(["teamname", "team_name", "team", "squadname", "clubname", "name"])
+    duel_type_col = find_column(["dueltype", "duel_type", "type", "category", "contesttype"])
+    won_col = find_column(["won", "wonduels", "won_count", "success", "successes", "wonvalue"])
+    lost_col = find_column(["lost", "lostduels", "lost_count", "fail", "fails", "lostvalue"])
+    total_col = find_column(["total", "duels", "duelcount", "count", "overall"])
+
+    result["teamId"] = frame[team_id_col] if team_id_col else np.nan
+    result["teamName"] = frame[team_name_col] if team_name_col else np.nan
+    result["duelType"] = frame[duel_type_col] if duel_type_col else np.nan
+
+    if won_col:
+        won_values = pd.to_numeric(frame[won_col], errors="coerce")
+    else:
+        won_values = pd.Series(np.nan, index=frame.index)
+
+    if lost_col:
+        lost_values = pd.to_numeric(frame[lost_col], errors="coerce")
+    elif total_col and won_col:
+        total_values = pd.to_numeric(frame[total_col], errors="coerce")
+        lost_values = total_values - won_values
+    else:
+        lost_values = pd.Series(np.nan, index=frame.index)
+
+    result["won"] = won_values.fillna(0.0)
+    result["lost"] = lost_values.fillna(0.0)
+    result["source"] = "DFL"
+
+    return result
 
 
 def prepare_table(
@@ -838,6 +946,125 @@ def safe_api_call(description: str, func, *args, **kwargs):
         return None
 
 
+def load_dfl_duel_data(match_id: int, iteration_id: int, token: str) -> pd.DataFrame:
+    """Fetch duel data for the match from the DFL/Heimspiel interface."""
+
+    if not should_fetch_dfl_duels():
+        raise ValueError(
+            "Keine DFL_DUELS_URL_TEMPLATE konfiguriert. Bitte setzen Sie die "
+            "Umgebungsvariable, um die DFL-Zweikampfschnittstelle anzusprechen."
+        )
+
+    match_lookup = ip.getDflMatchLookup(iterations=[iteration_id], token=token)
+    if match_lookup is None or match_lookup.empty:
+        raise ValueError("Keine DFL-Match-Zuordnung für die Iteration gefunden.")
+
+    mapping_row = match_lookup[match_lookup["impectMatchId"] == match_id]
+    if mapping_row.empty:
+        raise ValueError(f"Kein DFL-Match für matchId={match_id} gefunden.")
+
+    row = mapping_row.iloc[0]
+    dfl_match_id = row.get("dflMatchId")
+    if pd.isna(dfl_match_id):
+        raise ValueError(f"Der Match-Eintrag {match_id} enthält keine DFL-MatchId.")
+
+    try:
+        dfl_match_id_int = int(dfl_match_id)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Ungültige DFL-MatchId '{dfl_match_id}': {error}") from error
+
+    url = DFL_DUELS_URL_TEMPLATE.format(match_id=dfl_match_id_int, dfl_match_id=dfl_match_id_int)
+
+    headers = {"User-Agent": DFL_API_USER_AGENT or "impectPy-match-overview/1.0"}
+    if DFL_API_TOKEN:
+        headers["Authorization"] = f"Bearer {DFL_API_TOKEN}"
+
+    timeout = _parse_dfl_timeout()
+
+    response = requests.get(url, headers=headers, timeout=timeout)
+    response.raise_for_status()
+
+    try:
+        payload = response.json()
+    except ValueError as error:
+        raise ValueError("Antwort der DFL API konnte nicht als JSON geparst werden.") from error
+
+    duels = normalise_dfl_duels_payload(payload)
+    if duels.empty:
+        raise ValueError("Antwort enthielt keine verwertbaren Zweikampfdaten.")
+
+    # Map DFL team ids to Impect squad names for nicer labelling.
+    id_map: Dict[str, str] = {}
+    for column_id, name_column in [
+        ("homeDflTeamId", "homeSquadName"),
+        ("awayDflTeamId", "awaySquadName"),
+    ]:
+        if column_id in row and not pd.isna(row[column_id]):
+            try:
+                identifier = str(int(row[column_id]))
+            except (TypeError, ValueError):
+                continue
+            name_value = row.get(name_column)
+            if isinstance(name_value, str) and name_value.strip():
+                id_map[identifier] = name_value.strip()
+
+    squad_lookup = ip.getDflTeamLookup(iterations=[iteration_id], token=token)
+    if squad_lookup is not None and not squad_lookup.empty:
+        subset = squad_lookup.dropna(subset=["dflTeamId", "impectSquadName"])
+        if not subset.empty:
+            subset = subset.copy()
+            subset["dflTeamId"] = subset["dflTeamId"].astype("Int64")
+            for entry in subset.itertuples():
+                try:
+                    identifier = str(int(entry.dflTeamId))
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(entry.impectSquadName, str) and entry.impectSquadName.strip():
+                    id_map.setdefault(identifier, entry.impectSquadName.strip())
+
+    if "teamId" in duels.columns:
+        duels["teamId"] = duels["teamId"].apply(lambda value: str(int(value)) if pd.notna(value) else None)
+    else:
+        duels["teamId"] = None
+
+    if "teamName" in duels.columns:
+        duels = duels.rename(columns={"teamName": "dflTeamName"})
+    else:
+        duels["dflTeamName"] = np.nan
+
+    duels["impectSquadName"] = duels["teamId"].map(id_map)
+
+    duels["teamName"] = duels["impectSquadName"]
+    missing_mask = duels["teamName"].isna() | duels["teamName"].astype(str).str.strip().eq("")
+    duels.loc[missing_mask, "teamName"] = duels.loc[missing_mask, "dflTeamName"]
+    missing_mask = duels["teamName"].isna() | duels["teamName"].astype(str).str.strip().eq("")
+    duels.loc[missing_mask, "teamName"] = duels.loc[missing_mask, "teamId"]
+
+    duels["teamName"] = duels["teamName"].astype(str)
+    duels = duels[duels["teamName"].str.strip().astype(bool)].copy()
+
+    if "duelType" in duels.columns:
+        duels["duelType"] = duels["duelType"].apply(lambda value: value if pd.isna(value) else str(value))
+    else:
+        duels["duelType"] = np.nan
+
+    duels["won"] = pd.to_numeric(duels["won"], errors="coerce").fillna(0.0)
+    duels["lost"] = pd.to_numeric(duels["lost"], errors="coerce").fillna(0.0)
+
+    columns = [
+        "teamName",
+        "impectSquadName",
+        "teamId",
+        "duelType",
+        "won",
+        "lost",
+        "source",
+        "dflTeamName",
+    ]
+
+    return duels[[column for column in columns if column in duels.columns]].reset_index(drop=True)
+
+
 def load_additional_match_data(
     match_id: int,
     iteration_id: int,
@@ -847,6 +1074,17 @@ def load_additional_match_data(
     """Fetch optional match level datasets used for the extended dashboard."""
 
     additional: Dict[str, Optional[pd.DataFrame]] = {}
+
+    if should_fetch_dfl_duels():
+        additional["dfl_duels"] = safe_api_call(
+            "DFL Zweikampfdaten",
+            load_dfl_duel_data,
+            match_id=match_id,
+            iteration_id=iteration_id,
+            token=token,
+        )
+    else:
+        additional["dfl_duels"] = None
 
     additional["player_scores"] = safe_api_call(
         "Player Match Scores",
@@ -1044,6 +1282,63 @@ def normalise_duel_type(value: object) -> Optional[str]:
     return None
 
 
+def duel_metric_labels_for_type(duel_type: Optional[str]) -> Tuple[str, str]:
+    """Return the KPI labels used for the supplied duel type."""
+
+    if duel_type == "GROUND":
+        return "Won Ground Duels", "Lost Ground Duels"
+    if duel_type == "AERIAL":
+        return "Won Aerial Duels", "Lost Aerial Duels"
+    return "Won Duels", "Lost Duels"
+
+
+def compute_duel_absolutes_from_dfl(dfl_duels: Optional[pd.DataFrame]) -> Dict[str, Dict[str, float]]:
+    """Convert aggregated duel data from the DFL interface into KPI metrics."""
+
+    if dfl_duels is None or not isinstance(dfl_duels, pd.DataFrame) or dfl_duels.empty:
+        return {}
+
+    frame = dfl_duels.copy()
+
+    team_column = next((column for column in ["impectSquadName", "teamName"] if column in frame.columns), None)
+    if team_column is None:
+        return {}
+
+    frame["team"] = frame[team_column].astype(str).str.strip()
+    frame = frame[frame["team"].astype(bool)].copy()
+    if frame.empty:
+        return {}
+
+    frame["won"] = pd.to_numeric(frame.get("won"), errors="coerce").fillna(0.0)
+    frame["lost"] = pd.to_numeric(frame.get("lost"), errors="coerce").fillna(0.0)
+
+    if "duelType" in frame.columns:
+        frame["duelTypeKey"] = frame["duelType"].apply(normalise_duel_type)
+    else:
+        frame["duelTypeKey"] = None
+
+    summary: Dict[str, Dict[str, float]] = {}
+
+    grouped = frame.groupby(frame["duelTypeKey"].fillna("OVERALL"))
+    for duel_type_key, group in grouped:
+        duel_type = None if duel_type_key == "OVERALL" else duel_type_key
+        metric_won, metric_lost = duel_metric_labels_for_type(duel_type)
+        totals = group.groupby("team")["won"].sum()
+        losses = group.groupby("team")["lost"].sum()
+        if not totals.empty:
+            summary.setdefault(metric_won, {}).update({team: float(value) for team, value in totals.items()})
+        if not losses.empty:
+            summary.setdefault(metric_lost, {}).update({team: float(value) for team, value in losses.items()})
+
+    if "Won Duels" not in summary or "Lost Duels" not in summary:
+        totals = frame.groupby("team")["won"].sum()
+        losses = frame.groupby("team")["lost"].sum()
+        summary.setdefault("Won Duels", {}).update({team: float(value) for team, value in totals.items()})
+        summary.setdefault("Lost Duels", {}).update({team: float(value) for team, value in losses.items()})
+
+    return summary
+
+
 def compute_duel_absolutes(events: pd.DataFrame) -> Dict[str, Dict[str, float]]:
     """
     Leitet absolute Duellwerte pro Team ab – inklusive LOST aus Gegner-WON.
@@ -1166,12 +1461,14 @@ def main() -> None:
     match_id = choose_match(matchplan)
     ...
 
-def compute_team_kpis(events: pd.DataFrame) -> pd.DataFrame:
+def compute_team_kpis(events: pd.DataFrame, dfl_duels: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """Aggregate a selection of team level KPIs for the figure."""
 
     events = events.copy()
-    # --- NEU: teamübergreifende Duell-Absolutwerte (WON/LOST) robust ableiten ---
-    duel_abs_global = compute_duel_absolutes(events)
+    # Prioritise DFL duel data when available – fall back to the event feed otherwise.
+    duel_abs_global = compute_duel_absolutes_from_dfl(dfl_duels)
+    if not duel_abs_global:
+        duel_abs_global = compute_duel_absolutes(events)
     groups = events.groupby(["squadId", "squadName"])
 
     rows = []
@@ -2722,15 +3019,7 @@ def main() -> None:
 
     print("\n🧾 Hole Spieler-Stammdaten via getPlayerIterationAverages()...")
     iteration_players = ip.getPlayerIterationAverages(iteration_id, token)
-    print(f"✅ {len(iteration_players)} Spieler-Stammdatensätze geladen.\n")
-
-    team_kpis = compute_team_kpis(events)
-    phase_xg = compute_xg_by_phase(events)
-    timeline = compute_xg_timeline(events)
-
-    print("📊 Berechne Spielerratings (Offensiv & Defensiv)...")
-    player_ratings = compute_player_ratings(events, player_matchsums, iteration_players)
-    print(player_ratings.head(20).to_string(index=False))
+    print(f"✅ {len(iteration_players)} Spieler-Stammdatensätze geladen.")
 
     print("\n📦 Lade zusätzliche Kennzahlen (Scores & Ratings)...")
     additional_data = load_additional_match_data(
@@ -2739,6 +3028,24 @@ def main() -> None:
         token=token,
         events=events,
     )
+
+    dfl_duels = additional_data.get("dfl_duels")
+    if isinstance(dfl_duels, pd.DataFrame) and not dfl_duels.empty:
+        print("\n🔗 DFL-Zweikampfdaten (aggregiert):")
+        preview = dfl_duels.head(10)
+        print(preview.to_string(index=False))
+        if len(dfl_duels) > len(preview):
+            print(f"... ({len(dfl_duels)} Zeilen insgesamt)")
+    else:
+        print("\nℹ️ Keine DFL-Zweikampfdaten verfügbar oder Abruf übersprungen.")
+
+    team_kpis = compute_team_kpis(events, dfl_duels=dfl_duels)
+    phase_xg = compute_xg_by_phase(events)
+    timeline = compute_xg_timeline(events)
+
+    print("\n📊 Berechne Spielerratings (Offensiv & Defensiv)...")
+    player_ratings = compute_player_ratings(events, player_matchsums, iteration_players)
+    print(player_ratings.head(20).to_string(index=False))
 
     print("\n📈 Erzeuge Match-Übersichts-Grafik...")
     figure = build_match_figure(
